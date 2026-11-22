@@ -581,7 +581,7 @@ pub fn write_catalog_to_table(
     );
 
     sink_lf_to_partitioned_parquet(
-        lf,
+        lf.sort(["catalogid"], Default::default()),
         catalog_to_table_path,
         vec!["healpix_xmatch".into()],
         Default::default(),

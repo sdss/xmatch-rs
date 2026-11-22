@@ -363,7 +363,7 @@ fn xmatch_phase3_process_lf(
     // This sink partitions on healpix_xmatch but the file path provider in
     // PartitionedParquetSinkOptions actually creates the Dir=/Npix= directories.
     sink_lf_to_partitioned_parquet(
-        catalog_lf_no_pk,
+        catalog_lf_no_pk.sort(["catalogid"], Default::default()),
         &catalog_path.join(format!("Norder={}", xmatch_data.model.pixelation_order)),
         vec!["healpix_xmatch".into()],
         PartitionedParquetSinkOptions::default(),
@@ -396,7 +396,7 @@ fn xmatch_phase3_process_lf(
     let catalog_to_table_path = output_path.join(format!("{}/dataset", catalog_to_table_name));
 
     sink_lf_to_partitioned_parquet(
-        catalog_to_table_lf,
+        catalog_to_table_lf.sort(["catalogid"], Default::default()),
         &catalog_to_table_path.join(format!("Norder={}", xmatch_data.model.pixelation_order)),
         vec!["healpix_xmatch".into()],
         PartitionedParquetSinkOptions::default(),

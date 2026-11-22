@@ -536,7 +536,7 @@ fn _xmatch_phase2_pixel(
             });
 
         xmatch_tools::sink_lazyframe_pixel(
-            pixel_lf,
+            pixel_lf.sort(["catalogid"], Default::default()),
             tmp_path.clone().join("dataset"),
             xmatch_data.model.pixelation_order,
             xmatch_pixel,
