@@ -201,7 +201,7 @@ fn _create_hats_index_sequential(
         max_rows_per_file: Some(options.max_rows_per_file as u32),
         approximate_bytes_per_file: Some(options.max_kilobytes_per_file * 1024),
         sort_by: if options.sort {
-            Some(index_column.to_string())
+            Some(vec![index_column.to_string()])
         } else {
             None
         },

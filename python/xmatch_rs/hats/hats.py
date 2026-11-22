@@ -497,6 +497,9 @@ class HATS:
             approximate_bytes_per_file=max_kilobytes_per_file * 1024
             if max_kilobytes_per_file is not None
             else None,
+            sort_by=[self.schema.get_primary_key()]
+            if self.schema.get_primary_key() is not None
+            else None,
         )
 
     def resort(self, sort_by: list[str] | None = None, show_progress: bool = True):

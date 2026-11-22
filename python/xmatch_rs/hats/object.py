@@ -458,6 +458,7 @@ def _run_hats_healpix_phase(
             if phase.max_kilobytes_per_file is not None
             else None,
             is_dataset=True,
+            sort_by=phase.sort_by,
         )
         model.update_phase(phase_name, complete=True)
 
