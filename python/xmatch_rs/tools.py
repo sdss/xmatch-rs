@@ -21,6 +21,7 @@ import polars._typing
 import yaml
 
 import sdsstools.logger
+from sdsstools.rich import get_progress_bar
 
 from xmatch_rs import console
 
@@ -34,6 +35,7 @@ __all__: list[str] = [
     "get_current_time",
     "sink_to_file",
     "PrettyDumper",
+    "resort_dataset",
 ]
 
 
@@ -273,3 +275,56 @@ class PrettyDumper(yaml.SafeDumper):
 
     def increase_indent(self, flow=False, indentless=False):
         return super().increase_indent(flow, False)
+
+
+def resort_dataset(
+    files: list[str | pathlib.Path] | str | pathlib.Path,
+    sort_columns: list[str],
+    show_progress: bool = True,
+) -> None:
+    """Resorts a dataset of Parquet files by the specified columns.
+
+    This function rewrites the Parquet files in place, sorting the data by the
+    specified columns.
+
+    Parameters
+    ----------
+    files
+        A list of Parquet files to resort.
+    sort_columns
+        A list of column names to sort by.
+    show_progress
+        Whether to show a progress bar.
+
+    """
+
+    if isinstance(files, (str, pathlib.Path)):
+        if is_glob_pattern(str(files)):
+            files = [pathlib.Path(f) for f in glob.glob(str(files), recursive=True)]
+        else:
+            files = pathlib.Path(files)
+            if files.is_dir():
+                files = list(files.glob("**/*.parquet"))
+            else:
+                files = [files]
+
+    progress = get_progress_bar(console=console)
+    task = progress.add_task("[green]Resorting dataset...", total=len(files))
+
+    if show_progress:
+        progress.start()
+    else:
+        progress.stop()
+
+    for file in files:
+        file_path = pathlib.Path(file)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File '{file}' does not exist.")
+
+        lf = polars.scan_parquet(file_path)
+        lf_sorted = lf.sort(sort_columns, descending=False)
+        sink_to_file(lf_sorted, file_path, overwrite=True)
+
+        progress.update(task, advance=1)
+
+    progress.stop()
