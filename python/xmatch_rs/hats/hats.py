@@ -28,7 +28,7 @@ from xmatch_rs.hats.models import HATSPropertiesModel
 from xmatch_rs.hats.object import convert_to_hats_object_catalogue
 from xmatch_rs.hats.tools import calculate_max_proper_motion
 from xmatch_rs.schema import Schema
-from xmatch_rs.tools import get_xmatch_rs_logger
+from xmatch_rs.tools import get_xmatch_rs_logger, resort_dataset
 
 
 if TYPE_CHECKING:
@@ -497,6 +497,39 @@ class HATS:
             approximate_bytes_per_file=max_kilobytes_per_file * 1024
             if max_kilobytes_per_file is not None
             else None,
+        )
+
+    def resort(self, sort_by: list[str] | None = None, show_progress: bool = True):
+        """Resorts the object dataset in place.
+
+        Parameters
+        ----------
+        sort_by
+            A list of columns to sort the object dataset by. If None, the dataset
+            will be sorted by the primary key column defined in the schema.
+        show_progress
+            Whether to show a progress bar during the resorting process.
+
+        """
+
+        if sort_by is None:
+            primary_key = self.schema.get_primary_key()
+            if primary_key is None:
+                raise ValueError(
+                    "No primary key defined in the schema and no sort_by provided."
+                )
+            sort_by = [primary_key]
+
+        dataset_path = self.path / "object" / "dataset"
+        if not dataset_path.exists():
+            raise FileNotFoundError(
+                f"The object dataset directory {dataset_path!s} does not exist."
+            )
+
+        resort_dataset(
+            files=dataset_path / "**/*.parquet",
+            sort_columns=sort_by,
+            show_progress=show_progress,
         )
 
     def create_index(

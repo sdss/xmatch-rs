@@ -251,6 +251,9 @@ def convert_to_hats_object_catalogue(
                     ),
                     max_rows_per_file=max_rows_per_file,
                     max_kilobytes_per_file=max_kilobytes_per_file,
+                    sort_by=[schema.model.primary_key]
+                    if schema.model.primary_key
+                    else None,
                 )
             )
 

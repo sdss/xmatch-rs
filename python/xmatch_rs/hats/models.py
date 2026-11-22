@@ -217,6 +217,11 @@ class PhaseModel(BaseModel):
         Field(description="Keep the lower order directories after partitioning."),
     ] = False
 
+    sort_by: Annotated[
+        list[str] | None,
+        Field(description="Columns to sort by."),
+    ] = None
+
 
 class HATSPropertiesModel(BaseModel):
     """Model for HATS properties file based on IVOA HATS standard Table 1."""

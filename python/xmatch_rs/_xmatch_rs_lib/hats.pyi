@@ -17,6 +17,7 @@ def repartition(
     pixels: list[int] | None,
     max_rows_per_pixel: int | None,
     max_kilobytes_per_pixel: int | None,
+    sort_by: list[str] | None,
     n_workers: int | None,
     progress_file: str | pathlib.Path | None,
     keep_initial_order_directories: bool,
@@ -45,6 +46,8 @@ def repartition(
         The maximum number of kilobytes per pixel (i.e., of the
         ``Norder=<order_0>/Dir=?/Npix=?`` directory). If :obj:`None`,
         no limit is applied.
+    sort_by
+        A list of columns to sort the resulting pixels entries by.
     n_workers
         The number of workers to use. If :obj:`None`, uses half the available CPU cores.
     progress_file

@@ -49,12 +49,13 @@ pub(crate) mod py_hats {
         is_dataset: bool,
         max_rows_per_file: Option<u32>,
         approximate_bytes_per_file: Option<u64>,
+        sort_by: Option<Vec<String>>,
     ) -> Result<()> {
         let options = hats::rechunk::HATSRechunkOptions {
             is_dataset,
             max_rows_per_file,
             approximate_bytes_per_file,
-            sort_by: None,
+            sort_by,
         };
 
         hats::rechunk::rechunk_hats_dataset(path, options)
