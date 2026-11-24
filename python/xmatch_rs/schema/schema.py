@@ -194,6 +194,11 @@ class SchemaModel(BaseModel):
         Field(description="The column containing the epoch of the coordinates."),
     ] = None
 
+    parallax_column: Annotated[
+        str | None,
+        Field(description="The column containing the parallax of the sources."),
+    ] = None
+
     source_catalogue: Annotated[
         SourceCatalogueModel,
         Field(description="Source data information."),

@@ -484,6 +484,7 @@ fn get_catalog_lf(
         lit(get_unix_timestamp_ms()).alias("added_on"), // Will cast to datetime.
     ];
 
+    // Add pmra, pmdec and parallax columns. If the catalogue does not have them, we add empty columns.
     if let Some(pmra_column) = &cat_model.pmra_column {
         columns.push(col(pmra_column).alias("pmra"));
     } else {
@@ -494,6 +495,12 @@ fn get_catalog_lf(
         columns.push(col(pmdec_column).alias("pmdec"));
     } else {
         columns.push(col("pmdec"));
+    }
+
+    if let Some(parallax_column) = &cat_model.parallax_column {
+        columns.push(col(parallax_column).alias("parallax"));
+    } else {
+        columns.push(lit(Null {}).cast(DataType::Float32).alias("parallax"));
     }
 
     let catalog_lf = catalog_lf.select(columns);

@@ -234,6 +234,11 @@ class CatalogueModel(BaseModel):
         Field(description="The column containing the epoch of the coordinates."),
     ] = None
 
+    parallax_column: Annotated[
+        str | None,
+        Field(description="The column containing the parallax of the sources."),
+    ] = None
+
     phases: Annotated[
         list[PhaseModel],
         Field(

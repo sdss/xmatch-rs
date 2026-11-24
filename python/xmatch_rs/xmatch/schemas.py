@@ -22,6 +22,7 @@ CATALOG_SCHEMA = polars.Schema(
         "pmra": polars.Float64,
         "pmdec": polars.Float64,
         "epoch": polars.Float32,
+        "parallax": polars.Float32,
         "added_by": polars.String,
         "added_on": polars.Datetime(time_unit="ms", time_zone="UTC"),
         "version": polars.String,

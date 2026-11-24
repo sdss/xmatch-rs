@@ -97,6 +97,8 @@ pub struct CatalogueModel {
     #[serde(default)]
     pub epoch_column: Option<String>,
     #[serde(default)]
+    pub parallax_column: Option<String>,
+    #[serde(default)]
     pub phases: Vec<PhaseModel>,
 }
 
@@ -270,6 +272,7 @@ pub static CATALOG_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
         Field::new("pmra".into(), DataType::Float32),
         Field::new("pmdec".into(), DataType::Float32),
         Field::new("epoch".into(), DataType::Float32),
+        Field::new("parallax".into(), DataType::Float32),
         Field::new("added_by".into(), DataType::String),
         Field::new(
             "added_on".into(),
