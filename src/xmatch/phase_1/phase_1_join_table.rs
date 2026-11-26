@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use polars::prelude::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::available_parallelism;
 
 use crate::hats::dataset::{AsDataset, Dataset};
@@ -16,7 +16,7 @@ use crate::xmatch;
 use crate::xmatch::models::{JoinDirection, JoinPathModel, JoinPathTableType, XMatchData};
 use crate::xmatch::tools::get_xmatch_path;
 
-use super::phase_1_column::remove_already_xmatched;
+use super::phase_1_column::{RIGHT_ON_COLUMN, RIGHT_PK_COLUMN, remove_already_xmatched};
 
 // Process one join path on the primary key.
 // Here "left" is the catalogue that has already been cross-matched and "right" is the
@@ -239,6 +239,15 @@ fn xmatch_phase1_join_type_table_pixel(
         right_cat_dataset.get_frame()?
     };
 
+    // Keep only the primary key and join column of the right catalogue, with reserved names.
+    // Otherwise they could collide with the columns from catalog_to_<left> or the join table
+    // (e.g., if both primary keys are called source_id), or the primary key could be coalesced
+    // away if it is also the join column.
+    let right_cat_lf = right_cat_lf.select([
+        col(&right_cat_model.primary_key).alias(RIGHT_PK_COLUMN),
+        col(&join_path_model.right_on).alias(RIGHT_ON_COLUMN),
+    ]);
+
     // If the left join column is not the primary key in the catalog_to_<left> table, we need to
     // get it from the left catalogue before joining with the join table.
     let left_cat_model = xmatch_data
@@ -291,11 +300,23 @@ fn xmatch_phase1_join_type_table_pixel(
         .join(
             right_cat_lf,
             [col(join_path_model.join_table_right_on.clone().unwrap())],
-            [col(join_path_model.right_on.clone())],
+            [col(RIGHT_ON_COLUMN)],
             JoinArgs {
                 how: JoinType::Inner,
                 ..Default::default()
             },
+        );
+
+    // Restore the name of the right primary key, dropping any other column with that name.
+    let joined_lf = joined_lf
+        .drop(Selector::ByName {
+            names: Arc::new([right_cat_model.primary_key.clone().into()]),
+            strict: false,
+        })
+        .rename(
+            [RIGHT_PK_COLUMN],
+            [right_cat_model.primary_key.as_str()],
+            true,
         );
 
     // Finally, we remove entries that were already cross-matched using previous join paths.
