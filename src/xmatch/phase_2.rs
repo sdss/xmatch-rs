@@ -354,6 +354,20 @@ fn _xmatch_phase2_pixel(
         false,
     );
 
+    // If there is no xmatch data around this pixel (e.g., the catalogue covers sky that no
+    // previous catalogue covered) there is nothing to match. The targets will be added in
+    // phase 3.
+    if xmatch_dataset
+        .get_neighbours(order, pixel, true)?
+        .is_empty()
+    {
+        log::trace!(
+            "{} No xmatch data found around this pixel. Skipping.",
+            log_prefix
+        );
+        return Ok(());
+    }
+
     // Select the xmatch data within the buffer.
     let xmatch_lf = xmatch_dataset.get_pixel_with_buffer(order, pixel, buffer)?;
 
