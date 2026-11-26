@@ -15,6 +15,12 @@ use crate::tools::{self, IsEmpty};
 use crate::xmatch;
 use crate::xmatch::models::{JoinPathModel, XMatchData};
 
+/// Reserved name for the primary key of the catalogue being processed during phase 1 joins.
+pub(crate) const RIGHT_PK_COLUMN: &str = "__xmatch_right_pk";
+
+/// Reserved name for the join column of the catalogue being processed during phase 1 joins.
+pub(crate) const RIGHT_ON_COLUMN: &str = "__xmatch_right_on";
+
 // Process one join path on the primary key.
 // Here "left" is the catalogue already cross-matched and "right" is the catalogue being processed.
 pub(crate) fn xmatch_phase1_join_type_column(
@@ -179,9 +185,15 @@ fn xmatch_phase1_join_type_column_pixel(
     };
 
     // Filter the right_lf dataset. Remove any rows with null values in the join column.
+    // We use reserved names for the right primary key and join column. Otherwise they could
+    // collide with the columns from the left catalogue (e.g., if both primary keys are called
+    // source_id), or the primary key could be coalesced away if it is also the join column.
     let right_lf = right_lf
-        .select([col(&right_primary_key), col(&right_join_column)])
-        .filter(col(&right_join_column).is_not_null());
+        .select([
+            col(&right_primary_key).alias(RIGHT_PK_COLUMN),
+            col(&right_join_column).alias(RIGHT_ON_COLUMN),
+        ])
+        .filter(col(RIGHT_ON_COLUMN).is_not_null());
 
     // Exit early if there are no rows with non-null values in the join column.
     if right_lf.is_empty() {
@@ -258,14 +270,14 @@ fn xmatch_phase1_join_type_column_pixel(
     let catalog_to_lf =
         catalog_to_lf.select([col("catalogid"), col(&left_join_column), col("_healpix_29")]);
 
-    // Get the data type of the join column.
-    let right_join_dtype = xmatch::models::get_column_dtype(&right_lf, &right_join_column)?;
+    // Cast the right join column to the data type of the left join column.
+    let left_join_dtype = xmatch::models::get_column_dtype(&catalog_to_lf, &left_join_column)?;
 
     // Perform the join.
     let join_lf = catalog_to_lf.join(
         right_lf,
         [col(&left_join_column)],
-        [col(&right_join_column).cast(right_join_dtype)],
+        [col(RIGHT_ON_COLUMN).cast(left_join_dtype)],
         JoinArgs {
             how: JoinType::Inner,
             ..Default::default()
@@ -277,7 +289,7 @@ fn xmatch_phase1_join_type_column_pixel(
     let lf = join_lf.select([
         col("catalogid"),
         col("_healpix_29"),
-        col(&right_primary_key).alias("pk"),
+        col(RIGHT_PK_COLUMN).alias("pk"),
         lit(xmatch_data.model.version.clone())
             .cast(DataType::String)
             .alias("version"),
