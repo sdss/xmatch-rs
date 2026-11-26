@@ -477,7 +477,7 @@ fn get_catalog_lf(
                     // Output type specification for the query planner
                     |_schema, _fields| Ok(Field::new("_healpix_29".into(), DataType::UInt64)),
                 )
-                .alias("custom_result"),
+                .alias("_healpix_29"),
             )
     };
 

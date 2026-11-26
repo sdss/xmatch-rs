@@ -157,3 +157,52 @@ def test_phase_3_new_sky_area(make_hats, make_xmatch, run_id):
 
     catalog = read_catalog(xm)
     assert catalog.filter(polars.col.added_by == "cat_b").height == 100
+
+
+def test_phase_3_proper_motions(make_hats, make_xmatch, run_id):
+    """Phase 3 propagates coordinates and _healpix_29 for catalogues with pm."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    pmdec = numpy.full(100, 100.0)  # mas/yr
+
+    cat_a = polars.DataFrame(
+        {
+            "a_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "pmra": numpy.zeros(100),
+            "pmdec": pmdec,
+        }
+    )
+    hats_a = make_hats("cat_a", cat_a, "a_id", pm=True, epoch=2000.0)
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.run()
+
+    catalog = read_catalog(xm).join(
+        read_catalog_to(xm, "cat_a").select("catalogid", "a_id"),
+        on="catalogid",
+    )
+    catalog = catalog.sort("a_id")
+    assert catalog.height == 100
+
+    # 15.5 years at 100 mas/yr in Dec.
+    expected_dec = dec + 15.5 * 100.0 / 1000.0 / 3600.0
+    numpy.testing.assert_allclose(catalog["dec"].to_numpy(), expected_dec, atol=1e-9)
+    numpy.testing.assert_allclose(catalog["ra"].to_numpy(), ra, atol=1e-9)
+
+    # _healpix_29 must correspond to the propagated coordinates.
+    order_29_size = 0.0004 / 3600.0  # ~0.4 mas in deg.
+    for row in catalog.head(10).iter_rows(named=True):
+        lon, lat = _healpix_29_center(row["_healpix_29"])
+        assert abs(lat - row["dec"]) < order_29_size
+
+
+def _healpix_29_center(pixel: int) -> tuple[float, float]:
+    """Returns the centre of an order 29 HEALPix pixel in degrees."""
+
+    import healpy
+
+    theta, phi = healpy.pix2ang(2**29, pixel, nest=True)
+    return float(numpy.degrees(phi)), float(90.0 - numpy.degrees(theta))
