@@ -498,3 +498,29 @@ def test_phase_1_join_table_left_on_not_pk(make_hats, make_xmatch, run_id, tmp_p
     catalog_to_a = read_catalog_to(xm, "cat_a").select("catalogid", "a_id")
     joined = catalog_to_c.join(catalog_to_a, on="catalogid")
     assert (joined["c_id"] == joined["a_id"]).all()
+
+
+def test_parallax_column(make_hats, make_xmatch, run_id):
+    """The parallax column of the catalogue is copied to catalog."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    parallax = numpy.linspace(0.1, 10.0, 100)
+    cat_a = polars.DataFrame(
+        {"a_id": numpy.arange(100), "ra": ra, "dec": dec, "parallax": parallax}
+    )
+    hats_a = make_hats("cat_a", cat_a, "a_id", parallax=True)
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    assert xm.model.get_catalogue("cat_a").parallax_column == "parallax"
+
+    xm.run()
+
+    catalog = read_catalog(xm).join(
+        read_catalog_to(xm, "cat_a").select("catalogid", "a_id"),
+        on="catalogid",
+    )
+    catalog = catalog.sort("a_id")
+
+    assert catalog["parallax"].null_count() == 0
+    numpy.testing.assert_allclose(catalog["parallax"].to_numpy(), parallax, rtol=1e-6)

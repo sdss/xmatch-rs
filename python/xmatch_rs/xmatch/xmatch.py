@@ -440,6 +440,7 @@ class XMatch:
         epoch = hats.schema.model.epoch
         epoch_column = hats.schema.model.epoch_column
         epoch_format = hats.schema.model.epoch_format
+        parallax_column = hats.schema.model.parallax_column
 
         if ra_column is None or dec_column is None:
             raise ValueError("RA and Dec columns must be specified in the HATS schema.")
@@ -460,6 +461,7 @@ class XMatch:
             epoch=epoch,
             epoch_column=epoch_column,
             epoch_format=epoch_format,
+            parallax_column=parallax_column,
         )
 
         return cat_model
