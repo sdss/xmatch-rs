@@ -168,6 +168,24 @@ pub(crate) fn run_phase_3(xmatch_data: XMatchData) -> Result<()> {
                     let catalog_to_table_path =
                         xmatch_dataset_path.join(format!("catalog_to_{}/dataset", cat_model.name));
 
+                    // Placeholder used when there are no catalog_to_table entries around this
+                    // pixel. In that case all the targets in the pixel are new.
+                    let empty_catalog_to_table_lf = || {
+                        let pk_dtype = cat_pixel_lf
+                            .clone()
+                            .collect_schema()
+                            .unwrap()
+                            .get(&cat_model.primary_key.clone())
+                            .unwrap()
+                            .clone();
+
+                        DataFrame::empty_with_arc_schema(Arc::new(Schema::from_iter(vec![
+                            Field::new("catalogid".into(), DataType::UInt64),
+                            Field::new(cat_model.primary_key.clone().into(), pk_dtype),
+                        ])))
+                        .lazy()
+                    };
+
                     let catalog_to_table_lf = if catalog_to_table_path.exists() {
                         let catalog_to_table_dataset =
                             Dataset::new(catalog_to_table_path.clone(), false);
@@ -180,27 +198,15 @@ pub(crate) fn run_phase_3(xmatch_data: XMatchData) -> Result<()> {
                             .copied()
                             .collect::<Vec<_>>();
 
+                        // No targets in this region were matched in phases 1 or 2. We still
+                        // need to process the pixel so that its targets are added to catalog.
                         if cat_to_pixels.is_empty() {
-                            return Ok(());
+                            empty_catalog_to_table_lf()
+                        } else {
+                            catalog_to_table_dataset.scan_pixels(cat_to_pixels)?
                         }
-
-                        catalog_to_table_dataset.scan_pixels(cat_to_pixels)?
                     } else {
-                        let pk_dtype = cat_pixel_lf
-                            .clone()
-                            .collect_schema()
-                            .unwrap()
-                            .get(&cat_model.primary_key.clone())
-                            .unwrap()
-                            .clone();
-
-                        let catalog_to_table_df =
-                            DataFrame::empty_with_arc_schema(Arc::new(Schema::from_iter(vec![
-                                Field::new("catalogid".into(), DataType::UInt64),
-                                Field::new(cat_model.primary_key.clone().into(), pk_dtype),
-                            ])));
-
-                        catalog_to_table_df.lazy()
+                        empty_catalog_to_table_lf()
                     };
 
                     xmatch_phase3_process_lf(
@@ -226,12 +232,16 @@ pub(crate) fn run_phase_3(xmatch_data: XMatchData) -> Result<()> {
         }
     }
 
-    // Log number of rows.
-    let lf_catalog = LazyFrame::scan_parquet(
-        to_pl_path(tmp_path.join("catalog/dataset"))?,
-        Default::default(),
-    )?;
-    let n_rows_catalog = lf_row_count(&lf_catalog)?;
+    // Log number of rows. If no targets were added the temporary catalog dataset
+    // does not exist.
+    let tmp_catalog_dataset_path = tmp_path.join("catalog/dataset");
+    let n_rows_catalog = if tmp_catalog_dataset_path.exists() {
+        let lf_catalog =
+            LazyFrame::scan_parquet(to_pl_path(tmp_catalog_dataset_path)?, Default::default())?;
+        lf_row_count(&lf_catalog)?
+    } else {
+        0
+    };
 
     log::info!(
         "{} Phase 3 for catalogue {} completed. Added {} entries to catalog.",
@@ -475,7 +485,7 @@ fn get_catalog_lf(
                     // Output type specification for the query planner
                     |_schema, _fields| Ok(Field::new("_healpix_29".into(), DataType::UInt64)),
                 )
-                .alias("custom_result"),
+                .alias("_healpix_29"),
             )
     };
 
