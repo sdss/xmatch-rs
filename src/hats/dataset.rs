@@ -376,14 +376,6 @@ pub trait AsDataset {
     ///
     /// A `Result` containing a `LazyFrame` for the dataset entries within the selected region.
     fn get_pixel_with_buffer(&self, order: u8, pixel: u64, buffer: f32) -> Result<LazyFrame> {
-        let schema = self.scan_pixel(order, pixel, true)?.collect_schema()?;
-        if !schema.contains("_healpix_29") {
-            bail!("Missing column: _healpix_29");
-        }
-
-        // Get the BMOC covering the margin around the cell.
-        let bmoc = crate::hats::margin::get_margin_bmoc(order, pixel, buffer, None);
-
         // TODO: this will fail to get all the necessary pixels if the margin is large enough to
         // include pixels that are not direct neighbours. A better way would be to keep including
         // concentric rings of neighbours. When none of the neighbours of a neighbour have
@@ -391,6 +383,20 @@ pub trait AsDataset {
         // creating a margin to account for proper motions, and if the pixelation order is small
         // enough, what we do now is probably sufficient.
         let neighbours = self.get_neighbours(order, pixel, true)?;
+
+        if neighbours.is_empty() {
+            bail!("No pixels in the dataset intersect with ({order}, {pixel}) or its neighbours.");
+        }
+
+        // Check the schema using the pixels we will actually read. The central pixel may not
+        // exist in the dataset even if some of its neighbours do.
+        let schema = self.scan_pixels(neighbours.clone())?.collect_schema()?;
+        if !schema.contains("_healpix_29") {
+            bail!("Missing column: _healpix_29");
+        }
+
+        // Get the BMOC covering the margin around the cell.
+        let bmoc = crate::hats::margin::get_margin_bmoc(order, pixel, buffer, None);
 
         // Iterate over the neighbours and collect the targets that fall within the margin.
         let mut frames: Vec<LazyFrame> = vec![];
