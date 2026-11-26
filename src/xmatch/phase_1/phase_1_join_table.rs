@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use polars::prelude::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::available_parallelism;
 
 use crate::hats::dataset::{AsDataset, Dataset};
@@ -193,11 +193,28 @@ fn xmatch_phase1_join_type_table_pixel(
         false,
     );
 
+    // Only use the best associations in catalog_to_<left>, as in the column join.
     let catalog_to_lf = if use_partitioning {
+        // The left catalogue may not have any entries in this xmatch pixel.
+        if !catalog_to_dataset
+            .partition()
+            .contains(xmatch_order, xmatch_pixel)?
+        {
+            log::trace!(
+                "{} ({}, {}): no catalog_to_{} entries in pixel, skipping.",
+                log_prefix,
+                xmatch_order,
+                xmatch_pixel,
+                join_path_model.left_catalogue
+            );
+            return Ok(());
+        }
+
         catalog_to_dataset.scan_pixel(xmatch_order, xmatch_pixel, false)?
     } else {
         catalog_to_dataset.get_frame()?
-    };
+    }
+    .filter(col("best").eq(lit(true)));
 
     // Read the join table. We assume that the join table may not be in HATS format, so we scan
     // all the parquet files.
@@ -231,6 +248,44 @@ fn xmatch_phase1_join_type_table_pixel(
         col(&join_path_model.right_on).alias(RIGHT_ON_COLUMN),
     ]);
 
+    // If the left join column is not the primary key in the catalog_to_<left> table, we need to
+    // get it from the left catalogue before joining with the join table.
+    let left_cat_model = xmatch_data
+        .get_catalogue_model(&join_path_model.left_catalogue)
+        .unwrap();
+
+    let catalog_to_lf = if join_path_model.left_on != left_cat_model.primary_key {
+        let left_cat_dataset = Dataset::new(left_cat_model.hats_path.clone(), true);
+
+        let left_cat_lf = if use_partitioning {
+            let left_cat_pixels =
+                left_cat_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
+            if left_cat_pixels.is_empty() {
+                return Ok(());
+            }
+            left_cat_dataset.scan_pixels(left_cat_pixels)?
+        } else {
+            left_cat_dataset.get_frame()?
+        };
+
+        let left_cat_lf = left_cat_lf.select([
+            col(&left_cat_model.primary_key),
+            col(&join_path_model.left_on),
+        ]);
+
+        catalog_to_lf.join(
+            left_cat_lf,
+            [col(&left_cat_model.primary_key)],
+            [col(&left_cat_model.primary_key)],
+            JoinArgs {
+                how: JoinType::Inner,
+                ..Default::default()
+            },
+        )
+    } else {
+        catalog_to_lf
+    };
+
     // Let's do all the joins now.
     let joined_lf = catalog_to_lf
         .join(
@@ -251,36 +306,6 @@ fn xmatch_phase1_join_type_table_pixel(
                 ..Default::default()
             },
         );
-
-    // If the left join column is not the primary key in the catalog_to_<left> table, we need to
-    // handle it differently.
-    let left_cat_model = xmatch_data
-        .get_catalogue_model(&join_path_model.left_catalogue)
-        .unwrap();
-
-    let joined_lf = if join_path_model.left_on != left_cat_model.primary_key {
-        let left_cat_dataset = Dataset::new(left_cat_model.hats_path.clone(), true);
-
-        let left_cat_lf = if use_partitioning {
-            let left_cat_pixels =
-                left_cat_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
-            left_cat_dataset.scan_pixels(left_cat_pixels)?
-        } else {
-            left_cat_dataset.get_frame()?
-        };
-
-        left_cat_lf.join(
-            joined_lf,
-            [col(left_cat_model.primary_key.clone())],
-            [col(left_cat_model.primary_key.clone())],
-            JoinArgs {
-                how: JoinType::Inner,
-                ..Default::default()
-            },
-        )
-    } else {
-        joined_lf
-    };
 
     // Restore the name of the right primary key, dropping any other column with that name.
     let joined_lf = joined_lf
@@ -323,16 +348,25 @@ fn xmatch_phase1_join_type_table_pixel(
         lf_nrows
     );
 
-    // If the join table is of type Gaia neighbourhood, each row may be matched to multiple
-    // neighbours. We use the score column to select the best but we keep the all.
+    // If the join table is of type Gaia neighbourhood, each target in the new catalogue may be
+    // matched to multiple neighbours. For each target we mark as best the neighbour with the
+    // highest score (ties are broken by the lowest catalogid) but we keep all of them.
     let lf = if join_path_model
         .join_table_type
         .as_ref()
         .is_some_and(|v| *v == JoinPathTableType::GaiaNeighbourhood)
     {
-        joined_lf.with_columns([col("score")
-            .eq(col("score").max())
-            .over([col("score")])?
+        let right_pk = col(&right_cat_model.primary_key);
+
+        let is_max_score = col("score").eq(col("score").max().over([right_pk.clone()])?);
+        let min_catalogid_max_score = when(is_max_score.clone())
+            .then(col("catalogid"))
+            .otherwise(lit(NULL))
+            .min()
+            .over([right_pk])?;
+
+        joined_lf.with_columns([is_max_score
+            .and(col("catalogid").eq(min_catalogid_max_score))
             .alias("best")])
     } else {
         joined_lf.with_columns([lit(true).alias("best")])
