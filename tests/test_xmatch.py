@@ -558,3 +558,38 @@ def test_get_as_lazyframe(make_hats, make_xmatch, run_id):
     assert catalog_to_a.height == 100
     assert catalog_to_a.columns[:2] == ["catalogid", "a_id"]
     assert set(catalog_to_a["a_id"]) == set(range(100))
+
+
+def test_phase_3_catalog_and_catalog_to_consistent(make_hats, make_xmatch, run_id):
+    """catalog and catalog_to_<cat> agree on the catalogid of each new target."""
+
+    ra, dec = random_patch(400, 10.0, 10.0, size=2.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(400), "ra": ra, "dec": dec})
+
+    # Even B targets match A in phase 2. Odd ones are new and added in phase 3.
+    ra_b, dec_b = offset_coords(ra, dec, 0.3)
+    _, dec_far = offset_coords(ra, dec, 30)
+    dec_b[1::2] = dec_far[1::2]
+    cat_b = polars.DataFrame({"b_id": numpy.arange(400), "ra": ra_b, "dec": dec_b})
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0)
+    xm.run()
+
+    catalog = read_catalog(xm).filter(polars.col.added_by == "cat_b")
+    catalog_to_b = read_catalog_to(xm, "cat_b").filter(polars.col.added_by_phase == 3)
+    assert catalog.height == 200
+    assert set(catalog_to_b["b_id"]) == set(range(1, 400, 2))
+
+    # The coordinates in catalog for each catalogid are those of the B target that
+    # catalog_to_cat_b associates with it.
+    joined = catalog.join(catalog_to_b.select("catalogid", "b_id"), on="catalogid")
+    assert joined.height == 200
+
+    joined = joined.join(cat_b, on="b_id", suffix="_b")
+    numpy.testing.assert_allclose(joined["ra"], joined["ra_b"], atol=1e-9)
+    numpy.testing.assert_allclose(joined["dec"], joined["dec_b"], atol=1e-9)
