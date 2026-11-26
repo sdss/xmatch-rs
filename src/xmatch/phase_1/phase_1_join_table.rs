@@ -193,6 +193,7 @@ fn xmatch_phase1_join_type_table_pixel(
         false,
     );
 
+    // Only use the best associations in catalog_to_<left>, as in the column join.
     let catalog_to_lf = if use_partitioning {
         // The left catalogue may not have any entries in this xmatch pixel.
         if !catalog_to_dataset
@@ -212,7 +213,8 @@ fn xmatch_phase1_join_type_table_pixel(
         catalog_to_dataset.scan_pixel(xmatch_order, xmatch_pixel, false)?
     } else {
         catalog_to_dataset.get_frame()?
-    };
+    }
+    .filter(col("best").eq(lit(true)));
 
     // Read the join table. We assume that the join table may not be in HATS format, so we scan
     // all the parquet files.
