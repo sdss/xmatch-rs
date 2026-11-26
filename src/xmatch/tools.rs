@@ -144,15 +144,11 @@ pub fn get_max_catalogid(
                 )
                 .alias("run_id")])
             .filter(col("run_id").eq(lit(run_id as u64)))
-            .select([col("catalogid")])
+            .select([col("catalogid").max()])
             .collect()?;
 
-        if max_cid_df.height() == 0 {
-            let max_cid = (run_id as u64) << RUN_ID_BIT_SHIFT;
-            update_run_id_cache(&xmatch_path, run_id, max_cid)?;
-            return Ok(max_cid);
-        }
-
+        // If there are no catalogids for this run_id, the max() aggregation returns a single
+        // null value, which we handle below.
         let max_cid = max_cid_df
             .column("catalogid")?
             .u64()?
