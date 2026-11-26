@@ -340,6 +340,14 @@ fn xmatch_phase3_process_lf(
                 },
             )
         }
+
+        // The catalogids are assigned with a row index, and the resulting frame is evaluated
+        // several times (to count the rows and to write catalog and catalog_to_table). The
+        // order of the rows after the join is not guaranteed to be the same in each evaluation,
+        // which could assign different catalogids to the same target in catalog and
+        // catalog_to_table. Materialise the frame (a single pixel) so that the row order is
+        // fixed.
+        cat_lf = cat_lf.collect()?.lazy();
     }
 
     if cat_lf.is_empty() {
@@ -349,7 +357,12 @@ fn xmatch_phase3_process_lf(
     // Add the catalogid column. Here we rely on the catalogid cache. To prevent multiple threads
     // reading/updating the cache at the same time, we use a mutex lock.
     let _guard = CATID_LOCK.lock().unwrap();
-    let cat_lf = add_catalogid(None, &cat_lf, cat_model.run_id as usize, true)?;
+    let cat_lf = add_catalogid(
+        xmatch_data.path.clone(),
+        &cat_lf,
+        cat_model.run_id as usize,
+        true,
+    )?;
     drop(_guard);
 
     // Build the catalog lf.

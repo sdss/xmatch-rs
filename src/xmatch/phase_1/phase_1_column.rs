@@ -204,6 +204,21 @@ fn xmatch_phase1_join_type_column_pixel(
     );
 
     let catalog_to_lf = if use_partitioning {
+        // The left catalogue may not have any entries in this xmatch pixel.
+        if !catalog_to_dataset
+            .partition()
+            .contains(xmatch_order, xmatch_pixel)?
+        {
+            log::trace!(
+                "{} ({}, {}): no catalog_to_{} entries in pixel, skipping.",
+                log_prefix,
+                xmatch_order,
+                xmatch_pixel,
+                left_cat_model.name
+            );
+            return Ok(());
+        }
+
         catalog_to_dataset
             .scan_pixel(xmatch_order, xmatch_pixel, false)?
             .filter(col("best").eq(lit(true)))
