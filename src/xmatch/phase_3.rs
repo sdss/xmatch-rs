@@ -349,7 +349,12 @@ fn xmatch_phase3_process_lf(
     // Add the catalogid column. Here we rely on the catalogid cache. To prevent multiple threads
     // reading/updating the cache at the same time, we use a mutex lock.
     let _guard = CATID_LOCK.lock().unwrap();
-    let cat_lf = add_catalogid(None, &cat_lf, cat_model.run_id as usize, true)?;
+    let cat_lf = add_catalogid(
+        xmatch_data.path.clone(),
+        &cat_lf,
+        cat_model.run_id as usize,
+        true,
+    )?;
     drop(_guard);
 
     // Build the catalog lf.

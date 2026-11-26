@@ -130,6 +130,9 @@ def read_catalog(xm: XMatch) -> polars.DataFrame:
     """Reads the ``catalog`` dataset of a cross-match product."""
 
     path = xm.path / "catalog" / "dataset"
+    if not path.exists() or not any(path.rglob("*.parquet")):
+        return polars.DataFrame(schema={"catalogid": polars.UInt64, "added_by": str})
+
     return polars.scan_parquet(path, hive_partitioning=False).collect()
 
 
@@ -137,7 +140,7 @@ def read_catalog_to(xm: XMatch, name: str) -> polars.DataFrame:
     """Reads the ``catalog_to_<name>`` dataset of a cross-match product."""
 
     path = xm.path / f"catalog_to_{name}" / "dataset"
-    if not path.exists():
+    if not path.exists() or not any(path.rglob("*.parquet")):
         return polars.DataFrame()
 
     return polars.scan_parquet(path, hive_partitioning=False).collect()
