@@ -114,6 +114,25 @@ pub(crate) fn run_phase_2(xmatch_data: XMatchData) -> Result<()> {
         tracker.terminate().unwrap();
     }
 
+    // Each catalogue pixel is processed independently, so a catalogid near the edge of a pixel
+    // may have been matched by targets from different pixels. Now that all the pixels have been
+    // processed, select the best match for each catalogid.
+    let tmp_catalog_to_table_path = xmatch_tools::get_temp_dir_path(
+        xmatch_data.path.clone(),
+        &cat_model.name,
+        &xmatch_data.model.version,
+        cat_model.run_id as usize,
+        false,
+    )?
+    .join(format!("catalog_to_{}/dataset", cat_model.name));
+
+    log::debug!(
+        "{} Selecting the best match for each catalogid.",
+        log_prefix
+    );
+
+    pool.install(|| set_best_per_catalogid(&tmp_catalog_to_table_path, &cat_model.primary_key))?;
+
     // Print number of rows added to catalog_to_table.
     let catalog_to_table_path =
         xmatch_tools::get_xmatch_path(xmatch_data.path.clone(), Some(cat_model.name.clone()))?;
@@ -622,4 +641,82 @@ fn get_max_pm_offset(cat_lf: &LazyFrame, cat_model: &CatalogueModel, to_epoch: f
         .unwrap_or(0.0);
 
     Ok(max_pm_offset * 3600.0)
+}
+
+/// Sets the `best` column in the phase 2 `catalog_to_table` temporary dataset.
+///
+/// For each catalogid, only the closest target is marked as best (ties are broken by the lowest
+/// primary key value). This follows the behaviour of the SDSS-V cross-match, in which each
+/// catalogid has at most one best match in each catalogue.
+///
+/// The dataset is partitioned by the position of the catalogid at the xmatch order, so all the
+/// rows for a catalogid are in the same pixel directory. Each pixel directory is rewritten as a
+/// single file.
+fn set_best_per_catalogid(dataset_path: &std::path::Path, primary_key: &str) -> Result<()> {
+    use rayon::prelude::*;
+
+    if !dataset_path.exists() {
+        return Ok(());
+    }
+
+    let pattern = format!("{}/Norder=*/Dir=*/Npix=*", dataset_path.to_string_lossy());
+    let pixel_dirs = glob::glob(&pattern)?
+        .filter_map(|path| path.ok())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+
+    pixel_dirs.par_iter().try_for_each(|pixel_dir| {
+        let files = glob::glob(&format!("{}/*.parquet", pixel_dir.to_string_lossy()))?
+            .filter_map(|path| path.ok())
+            .collect::<Vec<_>>();
+
+        if files.is_empty() {
+            return Ok::<(), anyhow::Error>(());
+        }
+
+        let frames = files
+            .iter()
+            .map(|file| {
+                LazyFrame::scan_parquet(
+                    tools::to_pl_path(file)?,
+                    ScanArgsParquet {
+                        hive_options: HiveOptions::new_disabled(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let lf = concat(frames, UnionArgs::default())?;
+
+        // Closest target for each catalogid.
+        let is_min_distance = col("distance").eq(col("distance").min().over([col("catalogid")])?);
+
+        // Break ties using the lowest primary key.
+        let min_pk_min_distance = when(is_min_distance.clone())
+            .then(col(primary_key))
+            .otherwise(lit(NULL))
+            .min()
+            .over([col("catalogid")])?;
+
+        let best = is_min_distance.and(col(primary_key).eq(min_pk_min_distance));
+
+        let df = lf
+            .with_column(best.alias("best"))
+            .sort(["catalogid"], Default::default())
+            .collect()?;
+
+        // Write the new file and then remove the old ones.
+        let uuid = uuid::Uuid::new_v4().to_string().replace("-", "");
+        let new_file = pixel_dir.join(format!("{}.parquet", uuid));
+
+        xmatch_tools::sink_lazyframe_to_file(df.lazy(), &new_file)?;
+
+        for file in files {
+            std::fs::remove_file(file)?;
+        }
+
+        Ok(())
+    })
 }
