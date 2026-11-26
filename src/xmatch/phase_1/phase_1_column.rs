@@ -317,7 +317,7 @@ fn xmatch_phase1_join_type_column_pixel(
     // from a different join path. We remove those if they exist.
     // TODO: Better than removing them, it would be good to check that they are the same
     // associations and if they are not, do something nuanced.
-    let lf = remove_already_xmatched(lf, xmatch_order_pixel, xmatch_data)?;
+    let lf = remove_already_xmatched(lf, "pk", xmatch_order_pixel, xmatch_data)?;
 
     let lf_nrows = tools::lf_row_count(&lf)?;
 
@@ -353,8 +353,16 @@ fn xmatch_phase1_join_type_column_pixel(
     Ok(())
 }
 
+/// Removes rows that were already cross-matched by a previous join path.
+///
+/// `lf` is the frame of new associations, which must contain a `catalogid` column and the
+/// primary key of the catalogue being processed in a column named `pk_column`. Rows are removed
+/// if their catalogid or their primary key are already present in the temporary
+/// `catalog_to_<right>` dataset written by the previous join paths. Earlier join paths
+/// therefore take priority.
 pub(crate) fn remove_already_xmatched(
     lf: LazyFrame,
+    pk_column: &str,
     xmatch_order_pixel: Option<(u8, u64)>,
     xmatch_data: &XMatchData,
 ) -> Result<LazyFrame> {
@@ -362,39 +370,58 @@ pub(crate) fn remove_already_xmatched(
         .get_catalogue_model(xmatch_data.catalogue_name.as_str())
         .unwrap();
 
-    let catalog_to_right_table = format!("catalog_to_{}", right_cat_model.name);
-
+    // This must match the path where write_catalog_to_table() writes the temporary files.
     let catalog_to_right_path = xmatch::tools::get_temp_dir_path(
         xmatch_data.path.clone(),
-        &catalog_to_right_table,
+        &right_cat_model.name,
         &xmatch_data.model.version,
         right_cat_model.run_id as usize,
         false,
-    )?;
+    )?
+    .join(format!("catalog_to_{}", right_cat_model.name))
+    .join("dataset");
 
-    if catalog_to_right_path.exists() {
-        let catalog_to_right_dataset = Dataset::new(catalog_to_right_path.join("dataset"), false);
+    if !catalog_to_right_path.exists() {
+        return Ok(lf);
+    }
 
-        let catalog_to_right_lf = if let Some((xmatch_order, xmatch_pixel)) = xmatch_order_pixel {
-            catalog_to_right_dataset.scan_pixel(xmatch_order, xmatch_pixel, false)?
-        } else {
-            catalog_to_right_dataset.get_frame()?
-        };
+    let catalog_to_right_dataset = Dataset::new(catalog_to_right_path, false);
 
-        // Anti-join the match lazy frame with the catalog_dest_right_lf to remove any rows
-        // with catalogids that are already present.
-        let lf = lf.clone().join(
-            catalog_to_right_lf.select([col("catalogid")]),
+    let catalog_to_right_lf = if let Some((xmatch_order, xmatch_pixel)) = xmatch_order_pixel {
+        // Include the neighbours since the same target may have been associated with a
+        // catalogid in an adjacent pixel.
+        let pixels = catalog_to_right_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
+        if pixels.is_empty() {
+            return Ok(lf);
+        }
+        catalog_to_right_dataset.scan_pixels(pixels)?
+    } else {
+        catalog_to_right_dataset.get_frame()?
+    };
+
+    let right_pk = right_cat_model.primary_key.clone();
+
+    // Anti-join the new associations with the existing ones to remove any rows with
+    // catalogids or targets that are already present.
+    let lf = lf
+        .join(
+            catalog_to_right_lf.clone().select([col("catalogid")]),
             [col("catalogid")],
             [col("catalogid")],
             JoinArgs {
                 how: JoinType::Anti,
                 ..Default::default()
             },
+        )
+        .join(
+            catalog_to_right_lf.select([col(&right_pk)]),
+            [col(pk_column)],
+            [col(&right_pk)],
+            JoinArgs {
+                how: JoinType::Anti,
+                ..Default::default()
+            },
         );
 
-        return Ok(lf);
-    };
-
-    return Ok(lf);
+    Ok(lf)
 }
