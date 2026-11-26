@@ -740,6 +740,7 @@ class XMatch:
         catalogue_name: str,
         phase: int | None = None,
         delete_from_schema: bool = False,
+        force: bool = False,
     ):
         """Deletes a catalogue from the cross-match dataset.
 
@@ -754,8 +755,24 @@ class XMatch:
             Whether to delete the catalogue from the schema. If `False`, the phases
             are marked as incomplete; otherwise the entire catalogue entry is removed.
             Ignored if ``phase`` is specified.
+        force
+            Deleting the ``catalog`` entries added by a catalogue (``phase=None`` or
+            ``phase=3``) leaves the ``catalog_to`` tables of the catalogues
+            processed after it pointing to catalogids that no longer exist. By
+            default this raises an error if any later catalogue has been processed.
+            Set to `True` to delete anyway.
 
         """
+
+        if phase is None or phase == 3:
+            dependent = self._get_dependent_catalogues(catalogue_name)
+            if len(dependent) > 0 and not force:
+                raise RuntimeError(
+                    f"Cannot delete the catalog entries for {catalogue_name!r} "
+                    f"because catalogues {dependent!r} were processed after it and "
+                    "may be associated with its catalogids. Delete those catalogues "
+                    "first or use force=True."
+                )
 
         xmatch_lib.delete_catalogue_from_dataset(
             str(self.path),
@@ -783,6 +800,26 @@ class XMatch:
             cat.complete = False
 
         self.model.write()
+
+    def _get_dependent_catalogues(self, catalogue_name: str) -> list[str]:
+        """Returns the catalogues processed after a catalogue.
+
+        These catalogues may have ``catalog_to`` entries pointing to catalogids
+        added by ``catalogue_name``.
+
+        """
+
+        names = self.model.list_catalogue_names()
+        if catalogue_name not in names:
+            raise ValueError(f"Catalogue {catalogue_name!r} not found.")
+
+        later = self.model.catalogues[names.index(catalogue_name) + 1 :]
+
+        return [
+            cat.name
+            for cat in later
+            if cat.complete or any(phase.complete for phase in cat.phases)
+        ]
 
     def describe(self):
         """Returns a frame with the number of rows for each catalogue and phase."""
