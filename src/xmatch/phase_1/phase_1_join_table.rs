@@ -297,16 +297,25 @@ fn xmatch_phase1_join_type_table_pixel(
         lf_nrows
     );
 
-    // If the join table is of type Gaia neighbourhood, each row may be matched to multiple
-    // neighbours. We use the score column to select the best but we keep the all.
+    // If the join table is of type Gaia neighbourhood, each target in the new catalogue may be
+    // matched to multiple neighbours. For each target we mark as best the neighbour with the
+    // highest score (ties are broken by the lowest catalogid) but we keep all of them.
     let lf = if join_path_model
         .join_table_type
         .as_ref()
         .is_some_and(|v| *v == JoinPathTableType::GaiaNeighbourhood)
     {
-        joined_lf.with_columns([col("score")
-            .eq(col("score").max())
-            .over([col("score")])?
+        let right_pk = col(&right_cat_model.primary_key);
+
+        let is_max_score = col("score").eq(col("score").max().over([right_pk.clone()])?);
+        let min_catalogid_max_score = when(is_max_score.clone())
+            .then(col("catalogid"))
+            .otherwise(lit(NULL))
+            .min()
+            .over([right_pk])?;
+
+        joined_lf.with_columns([is_max_score
+            .and(col("catalogid").eq(min_catalogid_max_score))
             .alias("best")])
     } else {
         joined_lf.with_columns([lit(true).alias("best")])
