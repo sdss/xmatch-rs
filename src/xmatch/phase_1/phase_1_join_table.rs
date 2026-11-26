@@ -274,7 +274,12 @@ fn xmatch_phase1_join_type_table_pixel(
     };
 
     // Finally, we remove entries that were already cross-matched using previous join paths.
-    let joined_lf = remove_already_xmatched(joined_lf, xmatch_order_pixel, xmatch_data)?;
+    let joined_lf = remove_already_xmatched(
+        joined_lf,
+        &right_cat_model.primary_key,
+        xmatch_order_pixel,
+        xmatch_data,
+    )?;
 
     // Check the number of rows.
     let lf_nrows = crate::tools::lf_row_count(&joined_lf)?;
