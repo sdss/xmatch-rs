@@ -78,3 +78,37 @@ def test_phase_2_matches(make_hats, make_xmatch, run_id):
     catalog = read_catalog(xm)
     assert catalog.height == 300
     assert catalog["catalogid"].n_unique() == 300
+
+
+def test_get_as_lazyframe(make_hats, make_xmatch, run_id):
+    """get_as_lazyframe() reads the datasets written by the cross-match."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame(
+        {
+            "a_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "pmra": numpy.zeros(100),
+            "pmdec": numpy.zeros(100),
+        }
+    )
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+
+    # Before running, the frames are empty but have the right columns.
+    assert xm.get_as_lazyframe().collect().height == 0
+    assert "a_id" in xm.get_as_lazyframe("cat_a").collect_schema()
+
+    xm.run()
+
+    catalog = xm.get_as_lazyframe().collect()
+    assert catalog.height == 100
+    assert catalog.equals(read_catalog(xm).select(catalog.columns))
+
+    catalog_to_a = xm.get_as_lazyframe("cat_a").collect()
+    assert catalog_to_a.height == 100
+    assert catalog_to_a.columns[:2] == ["catalogid", "a_id"]
+    assert set(catalog_to_a["a_id"]) == set(range(100))

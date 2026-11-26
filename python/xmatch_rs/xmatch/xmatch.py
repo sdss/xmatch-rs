@@ -712,27 +712,48 @@ class XMatch:
         ----------
         table_name
             The name of the table to return. If `None`, returns the the ``catalog``
-            dataset. Otherwise returns the ``catalog_to_{table_name}`` dataset.
+            dataset. Otherwise returns the ``catalog_to_{table_name}`` dataset,
+            including the primary key column of the catalogue.
 
         """
 
         if table_name is None:
             catalog_dataset = self.path / "catalog" / "dataset"
-            if not catalog_dataset.exists():
+            if not catalog_dataset.exists() or not any(catalog_dataset.iterdir()):
                 return polars.LazyFrame(None, schema=CATALOG_SCHEMA)
             return polars.scan_parquet(
                 catalog_dataset,
                 schema=CATALOG_SCHEMA,
+                hive_partitioning=False,
             )
 
         catalog_to_table_dataset = self.path / f"catalog_to_{table_name}" / "dataset"
-        if not catalog_to_table_dataset.exists():
-            return polars.LazyFrame(None, schema=CATALOG_TO_TABLE_SCHEMA)
+
+        # The catalog_to table includes the primary key of the catalogue after the
+        # catalogid column. Its data type depends on the catalogue.
+        primary_key = self.model.get_catalogue(table_name).primary_key
+
+        if not catalog_to_table_dataset.exists() or not any(
+            catalog_to_table_dataset.iterdir()
+        ):
+            schema = dict(CATALOG_TO_TABLE_SCHEMA)
+            schema = {
+                "catalogid": schema.pop("catalogid"),
+                primary_key: polars.Int64,
+                **schema,
+            }
+            return polars.LazyFrame(None, schema=schema)
+
+        lf = polars.scan_parquet(catalog_to_table_dataset, hive_partitioning=False)
+        pk_dtype = lf.collect_schema()[primary_key]
+
+        schema = dict(CATALOG_TO_TABLE_SCHEMA)
+        schema = {"catalogid": schema.pop("catalogid"), primary_key: pk_dtype, **schema}
 
         return polars.scan_parquet(
             catalog_to_table_dataset,
-            schema=CATALOG_TO_TABLE_SCHEMA,
-            extra_columns="ignore",
+            schema=polars.Schema(schema),
+            hive_partitioning=False,
         )
 
     def delete_catalogue_data(
