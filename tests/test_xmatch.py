@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy
 import polars
+import pytest
 
 from .conftest import offset_coords, random_patch, read_catalog, read_catalog_to
 
@@ -261,6 +262,302 @@ def test_phase_1_multiple_join_paths(make_hats, make_xmatch, run_id, tmp_path):
     assert phase_1.height == 100
     assert phase_1.select("catalogid", "b_id").is_duplicated().sum() == 0
     assert set(phase_1["b_id"]) == set(range(1000, 1100))
+
+
+def test_delete_catalogue_with_dependents(make_hats, make_xmatch, run_id):
+    """Deleting a catalogue that later catalogues depend on requires force=True."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(100), "ra": ra, "dec": dec})
+
+    # Even B targets match A in phase 2. Odd ones are new.
+    ra_b, dec_b = offset_coords(ra, dec, 0.3)
+    _, dec_far = offset_coords(ra, dec, 30)
+    dec_b[1::2] = dec_far[1::2]
+    cat_b = polars.DataFrame({"b_id": numpy.arange(100), "ra": ra_b, "dec": dec_b})
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0)
+    xm.run()
+
+    # catalog_to_cat_b points to catalogids added by cat_a, so cat_a cannot be
+    # deleted while cat_b is there.
+    with pytest.raises(RuntimeError, match="processed after it"):
+        xm.delete_catalogue_data("cat_a")
+
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_a").height == 100
+
+    # Phase 1 and 2 deletions do not touch catalog and are allowed.
+    xm.delete_catalogue_data("cat_a", phase=1)
+
+    # Deleting the last catalogue is allowed, and then cat_a can be deleted.
+    xm.delete_catalogue_data("cat_b", delete_from_schema=True)
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_b").height == 0
+
+    xm.delete_catalogue_data("cat_a")
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_a").height == 0
+
+
+def test_delete_catalogue_force(make_hats, make_xmatch, run_id):
+    """force=True keeps the previous behaviour."""
+
+    ra, dec = random_patch(50, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(50), "ra": ra, "dec": dec})
+    ra_b, dec_b = offset_coords(ra, dec, 0.3)
+    cat_b = polars.DataFrame({"b_id": numpy.arange(50), "ra": ra_b, "dec": dec_b})
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats(
+        "cat_b",
+        cat_b,
+        "b_id",
+    )
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0, skip_phases=[3])
+    xm.run()
+
+    xm.delete_catalogue_data("cat_a", force=True)
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_a").height == 0
+    assert not xm.model.get_catalogue("cat_a").complete
+
+
+def test_phase_1_left_catalogue_partial_footprint(make_hats, make_xmatch, run_id):
+    """Phase 1 works when the left catalogue does not cover all the xmatch pixels."""
+
+    ra_a, dec_a = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(100), "ra": ra_a, "dec": dec_a})
+
+    # B covers a different patch, so the catalog dataset has pixels with no
+    # catalog_to_cat_a entries.
+    ra_b, dec_b = random_patch(100, 200.0, -30.0, seed=2)
+    cat_b = polars.DataFrame({"b_id": numpy.arange(100), "ra": ra_b, "dec": dec_b})
+
+    # C links to A through a column. It also has unlinked targets in B's patch,
+    # where there are no catalog_to_cat_a entries.
+    cat_c = polars.DataFrame(
+        {
+            "c_id": numpy.arange(200),
+            "ra": numpy.concatenate([ra_a, ra_b]),
+            "dec": numpy.concatenate([dec_a, dec_b]),
+            "a_ref": numpy.concatenate([numpy.arange(100), numpy.full(100, -1)]),
+        }
+    )
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+    hats_c = make_hats("cat_c", cat_c, "c_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", skip_phases=[2])
+    xm.add_catalogue(
+        hats_c.path,
+        name="cat_c",
+        skip_phases=[2, 3],
+        join_paths=[
+            {"left_catalogue": "cat_a", "left_on": "a_id", "right_on": "a_ref"}
+        ],
+    )
+    xm.run()
+
+    catalog_to_c = read_catalog_to(xm, "cat_c")
+    assert set(catalog_to_c["c_id"]) == set(range(100))
+    assert (catalog_to_c["added_by_phase"] == 1).all()
+
+
+def test_phase_1_gaia_neighbourhood_best(make_hats, make_xmatch, run_id, tmp_path):
+    """Only the highest-score neighbour of each target is marked as best."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+
+    # Pairs of A targets 5 arcsec apart. A[2i] and A[2i+1] are both neighbours of C[i].
+    ra_a = numpy.repeat(ra, 2)
+    dec_a = numpy.repeat(dec, 2)
+    dec_a[1::2] += 5 / 3600.0
+    cat_a = polars.DataFrame({"a_id": numpy.arange(200), "ra": ra_a, "dec": dec_a})
+
+    cat_c = polars.DataFrame(
+        {
+            "c_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "c_ref": numpy.arange(100),
+        }
+    )
+
+    join_table_path = tmp_path / "neighbourhood"
+    join_table_path.mkdir()
+    polars.DataFrame(
+        {
+            "jt_a_id": numpy.arange(200),
+            "jt_c_id": numpy.repeat(numpy.arange(100), 2),
+            "score": numpy.tile([0.5, 0.9], 100),
+        }
+    ).write_parquet(join_table_path / "join.parquet")
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_c = make_hats("cat_c", cat_c, "c_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(
+        hats_c.path,
+        name="cat_c",
+        skip_phases=[2, 3],
+        join_paths=[
+            {
+                "join_type": "join_table",
+                "join_table_type": "gaia_neighbourhood",
+                "left_catalogue": "cat_a",
+                "left_on": "a_id",
+                "right_on": "c_ref",
+                "join_table_path": join_table_path,
+                "join_table_left_on": "jt_a_id",
+                "join_table_right_on": "jt_c_id",
+            }
+        ],
+    )
+    xm.run()
+
+    # Both neighbours are kept but only one is best for each C target.
+    catalog_to_c = read_catalog_to(xm, "cat_c")
+    assert catalog_to_c.height == 200
+
+    best = catalog_to_c.filter(polars.col.best)
+    assert best.height == 100
+    assert set(best["c_id"]) == set(range(100))
+
+    # The best neighbour is the one with the highest score (A[2i+1]).
+    catalog_to_a = read_catalog_to(xm, "cat_a").select("catalogid", "a_id")
+    best_a_id = best.join(catalog_to_a, on="catalogid").sort("c_id")["a_id"]
+    assert (best_a_id == 2 * numpy.arange(100) + 1).all()
+
+
+def test_phase_1_join_table_left_on_not_pk(make_hats, make_xmatch, run_id, tmp_path):
+    """A join table can join on a left catalogue column that is not the primary key."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame(
+        {
+            "a_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "a_name": numpy.arange(5000, 5100),
+        }
+    )
+
+    cat_c = polars.DataFrame(
+        {
+            "c_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "c_ref": numpy.arange(100),
+        }
+    )
+
+    # The join table maps the A non-pk column a_name to C.
+    join_table_path = tmp_path / "join_a_c"
+    join_table_path.mkdir()
+    polars.DataFrame(
+        {"jt_a_name": numpy.arange(5000, 5100), "jt_c_ref": numpy.arange(100)}
+    ).write_parquet(join_table_path / "join.parquet")
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_c = make_hats("cat_c", cat_c, "c_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(
+        hats_c.path,
+        name="cat_c",
+        skip_phases=[2, 3],
+        join_paths=[
+            {
+                "join_type": "join_table",
+                "left_catalogue": "cat_a",
+                "left_on": "a_name",
+                "right_on": "c_ref",
+                "join_table_path": join_table_path,
+                "join_table_left_on": "jt_a_name",
+                "join_table_right_on": "jt_c_ref",
+            }
+        ],
+    )
+    xm.run()
+
+    catalog_to_c = read_catalog_to(xm, "cat_c")
+    assert catalog_to_c.height == 100
+
+    # Each C target is linked to the catalogid of the A target with the same index.
+    catalog_to_a = read_catalog_to(xm, "cat_a").select("catalogid", "a_id")
+    joined = catalog_to_c.join(catalog_to_a, on="catalogid")
+    assert (joined["c_id"] == joined["a_id"]).all()
+
+
+def test_parallax_column(make_hats, make_xmatch, run_id):
+    """The parallax column of the catalogue is copied to catalog."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    parallax = numpy.linspace(0.1, 10.0, 100)
+    cat_a = polars.DataFrame(
+        {"a_id": numpy.arange(100), "ra": ra, "dec": dec, "parallax": parallax}
+    )
+    hats_a = make_hats("cat_a", cat_a, "a_id", parallax=True)
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    assert xm.model.get_catalogue("cat_a").parallax_column == "parallax"
+
+    xm.run()
+
+    catalog = read_catalog(xm).join(
+        read_catalog_to(xm, "cat_a").select("catalogid", "a_id"),
+        on="catalogid",
+    )
+    catalog = catalog.sort("a_id")
+
+    assert catalog["parallax"].null_count() == 0
+    numpy.testing.assert_allclose(catalog["parallax"].to_numpy(), parallax, rtol=1e-6)
+
+
+def test_get_as_lazyframe(make_hats, make_xmatch, run_id):
+    """get_as_lazyframe() reads the datasets written by the cross-match."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame(
+        {
+            "a_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "pmra": numpy.zeros(100),
+            "pmdec": numpy.zeros(100),
+        }
+    )
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+
+    # Before running, the frames are empty but have the right columns.
+    assert xm.get_as_lazyframe().collect().height == 0
+    assert "a_id" in xm.get_as_lazyframe("cat_a").collect_schema()
+
+    xm.run()
+
+    catalog = xm.get_as_lazyframe().collect()
+    assert catalog.height == 100
+    assert catalog.equals(read_catalog(xm).select(catalog.columns))
+
+    catalog_to_a = xm.get_as_lazyframe("cat_a").collect()
+    assert catalog_to_a.height == 100
+    assert catalog_to_a.columns[:2] == ["catalogid", "a_id"]
+    assert set(catalog_to_a["a_id"]) == set(range(100))
 
 
 def test_phase_3_catalog_and_catalog_to_consistent(make_hats, make_xmatch, run_id):
