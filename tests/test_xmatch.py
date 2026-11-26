@@ -80,6 +80,38 @@ def test_phase_2_matches(make_hats, make_xmatch, run_id):
     assert catalog["catalogid"].n_unique() == 300
 
 
+def test_phase_2_new_sky_area(make_hats, make_xmatch, run_id):
+    """Phase 2 does not fail for catalogue pixels with no xmatch data around them."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(100), "ra": ra, "dec": dec})
+
+    # B has counterparts of all of A plus 100 targets in a far patch of sky that
+    # no previous catalogue covers.
+    ra_b, dec_b = offset_coords(ra, dec, 0.3)
+    ra_far, dec_far = random_patch(100, 200.0, -30.0, seed=2)
+
+    cat_b = polars.DataFrame(
+        {
+            "b_id": numpy.arange(200),
+            "ra": numpy.concatenate([ra_b, ra_far]),
+            "dec": numpy.concatenate([dec_b, dec_far]),
+        }
+    )
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0, skip_phases=[3])
+    xm.run()
+
+    catalog_to_b = read_catalog_to(xm, "cat_b")
+    assert set(catalog_to_b["b_id"]) == set(range(100))
+    assert (catalog_to_b["added_by_phase"] == 2).all()
+
+
 def test_phase_3_new_sky_area(make_hats, make_xmatch, run_id):
     """Phase 3 adds targets in pixels where nothing matched in phases 1 or 2."""
 
