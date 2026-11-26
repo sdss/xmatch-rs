@@ -78,3 +78,58 @@ def test_phase_2_matches(make_hats, make_xmatch, run_id):
     catalog = read_catalog(xm)
     assert catalog.height == 300
     assert catalog["catalogid"].n_unique() == 300
+
+
+def test_phase_1_multiple_join_paths(make_hats, make_xmatch, run_id, tmp_path):
+    """Associations from a later join path are not duplicated."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(100), "ra": ra, "dec": dec})
+
+    # B links to A through a column and through a join table with the same pairs.
+    cat_b = polars.DataFrame(
+        {
+            "b_id": numpy.arange(1000, 1100),
+            "ra": ra,
+            "dec": dec,
+            "a_ref": numpy.arange(100),
+            "b_ref": numpy.arange(1000, 1100),
+        }
+    )
+
+    join_table_path = tmp_path / "join_a_b"
+    join_table_path.mkdir()
+    polars.DataFrame(
+        {"jt_a_id": numpy.arange(100), "jt_b_id": numpy.arange(1000, 1100)}
+    ).write_parquet(join_table_path / "join.parquet")
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(
+        hats_b.path,
+        name="cat_b",
+        skip_phases=[2, 3],
+        join_paths=[
+            {"left_catalogue": "cat_a", "left_on": "a_id", "right_on": "a_ref"},
+            {
+                "join_type": "join_table",
+                "left_catalogue": "cat_a",
+                "left_on": "a_id",
+                "right_on": "b_ref",
+                "join_table_path": join_table_path,
+                "join_table_left_on": "jt_a_id",
+                "join_table_right_on": "jt_b_id",
+            },
+        ],
+    )
+    xm.run()
+
+    catalog_to_b = read_catalog_to(xm, "cat_b")
+    phase_1 = catalog_to_b.filter(polars.col.added_by_phase == 1)
+
+    assert phase_1.height == 100
+    assert phase_1.select("catalogid", "b_id").is_duplicated().sum() == 0
+    assert set(phase_1["b_id"]) == set(range(1000, 1100))
