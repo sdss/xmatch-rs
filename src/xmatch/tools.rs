@@ -50,13 +50,30 @@ pub fn get_temp_dir_path(
 }
 
 static RUN_ID_BIT_SHIFT: usize = 64 - 11;
-static RUN_ID_CACHE: LazyLock<Mutex<HashMap<usize, u64>>> =
+
+/// Cache of the maximum catalogid for each (xmatch root path, run_id) pair. The cache is
+/// global to the process so it must be keyed by the xmatch product as well as the run_id,
+/// otherwise processing two xmatch products in the same process would mix their catalogids.
+static RUN_ID_CACHE: LazyLock<Mutex<HashMap<(PathBuf, usize), u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Updates the run_id cache with the maximum catalogid for a given run_id.
-pub(crate) fn update_run_id_cache(run_id: usize, max_catalogid: u64) {
+/// Returns the key for the run_id cache.
+fn run_id_cache_key(xmatch_path: &Path, run_id: usize) -> Result<(PathBuf, usize)> {
+    let root = get_xmatch_path_root(xmatch_path.to_path_buf())?;
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    Ok((root, run_id))
+}
+
+/// Updates the run_id cache with the maximum catalogid for a given xmatch product and run_id.
+pub(crate) fn update_run_id_cache(
+    xmatch_path: &Path,
+    run_id: usize,
+    max_catalogid: u64,
+) -> Result<()> {
+    let key = run_id_cache_key(xmatch_path, run_id)?;
     let mut cache = RUN_ID_CACHE.lock().unwrap();
-    cache.insert(run_id, max_catalogid);
+    cache.insert(key, max_catalogid);
+    Ok(())
 }
 
 /// Clears the run_id cache.
@@ -72,22 +89,23 @@ pub fn get_max_catalogid(
     run_id: Option<usize>,
     use_cache: bool,
 ) -> Result<u64> {
-    // If we are using the cache, check if there is a hit and return.
-    if let Some(run_id) = run_id
-        && use_cache
-    {
-        let cache = RUN_ID_CACHE.lock().unwrap();
-        if let Some(cached_value) = cache.get(&run_id) {
-            return Ok(*cached_value);
-        }
-    }
-
     // We need access to the xmatch dataset to calculate the maximum catalogid.
     if xmatch_path.is_none() {
         bail!("Please provide xmatch_path.");
     }
 
     let xmatch_path = get_xmatch_path_root(xmatch_path.unwrap())?;
+
+    // If we are using the cache, check if there is a hit and return.
+    if let Some(run_id) = run_id
+        && use_cache
+    {
+        let key = run_id_cache_key(&xmatch_path, run_id)?;
+        let cache = RUN_ID_CACHE.lock().unwrap();
+        if let Some(cached_value) = cache.get(&key) {
+            return Ok(*cached_value);
+        }
+    }
 
     // Read the dataset. Use a schema so that even if it's empty we get the catalogid column.
     let lf = LazyFrame::scan_parquet(
@@ -102,10 +120,10 @@ pub fn get_max_catalogid(
     if let Some(run_id) = run_id {
         // Get the maximum catalogid. If that catalogid matches the run_id we are done and we don't
         // need to do the expensive bit-shifting operation bellow.
-        let max_catalogid = get_max_catalogid(Some(xmatch_path), None, false)?;
+        let max_catalogid = get_max_catalogid(Some(xmatch_path.clone()), None, false)?;
 
         if (max_catalogid >> RUN_ID_BIT_SHIFT) == run_id as u64 {
-            update_run_id_cache(run_id, max_catalogid);
+            update_run_id_cache(&xmatch_path, run_id, max_catalogid)?;
             return Ok(max_catalogid);
         }
 
@@ -131,7 +149,7 @@ pub fn get_max_catalogid(
 
         if max_cid_df.height() == 0 {
             let max_cid = (run_id as u64) << RUN_ID_BIT_SHIFT;
-            update_run_id_cache(run_id, max_cid);
+            update_run_id_cache(&xmatch_path, run_id, max_cid)?;
             return Ok(max_cid);
         }
 
@@ -142,7 +160,7 @@ pub fn get_max_catalogid(
             .unwrap_or((run_id as u64) << RUN_ID_BIT_SHIFT);
 
         // Store the value in the cache.
-        update_run_id_cache(run_id, max_cid);
+        update_run_id_cache(&xmatch_path, run_id, max_cid)?;
 
         Ok(max_cid)
     } else {
@@ -161,12 +179,12 @@ pub fn get_max_catalogid(
 
 /// Adds a `catalogid` column to the input `LazyFrame`.
 pub fn add_catalogid(
-    xmatch_path: Option<PathBuf>,
+    xmatch_path: PathBuf,
     cat_lf: &LazyFrame,
     run_id: usize,
     update_cache: bool,
 ) -> Result<LazyFrame> {
-    let max_cat_id = get_max_catalogid(xmatch_path, Some(run_id), true)?;
+    let max_cat_id = get_max_catalogid(Some(xmatch_path.clone()), Some(run_id), true)?;
     let cat_lf = cat_lf
         .clone()
         .with_row_index(PlSmallStr::from("catalogid"), None)
@@ -175,7 +193,7 @@ pub fn add_catalogid(
     if update_cache {
         let n_rows = lf_row_count(&cat_lf)? as u64;
         let new_max_cat_id = max_cat_id + 1 + n_rows;
-        update_run_id_cache(run_id, new_max_cat_id);
+        update_run_id_cache(&xmatch_path, run_id, new_max_cat_id)?;
     }
 
     Ok(cat_lf)
