@@ -437,3 +437,64 @@ def test_phase_1_gaia_neighbourhood_best(make_hats, make_xmatch, run_id, tmp_pat
     catalog_to_a = read_catalog_to(xm, "cat_a").select("catalogid", "a_id")
     best_a_id = best.join(catalog_to_a, on="catalogid").sort("c_id")["a_id"]
     assert (best_a_id == 2 * numpy.arange(100) + 1).all()
+
+
+def test_phase_1_join_table_left_on_not_pk(make_hats, make_xmatch, run_id, tmp_path):
+    """A join table can join on a left catalogue column that is not the primary key."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame(
+        {
+            "a_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "a_name": numpy.arange(5000, 5100),
+        }
+    )
+
+    cat_c = polars.DataFrame(
+        {
+            "c_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "c_ref": numpy.arange(100),
+        }
+    )
+
+    # The join table maps the A non-pk column a_name to C.
+    join_table_path = tmp_path / "join_a_c"
+    join_table_path.mkdir()
+    polars.DataFrame(
+        {"jt_a_name": numpy.arange(5000, 5100), "jt_c_ref": numpy.arange(100)}
+    ).write_parquet(join_table_path / "join.parquet")
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_c = make_hats("cat_c", cat_c, "c_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(
+        hats_c.path,
+        name="cat_c",
+        skip_phases=[2, 3],
+        join_paths=[
+            {
+                "join_type": "join_table",
+                "left_catalogue": "cat_a",
+                "left_on": "a_name",
+                "right_on": "c_ref",
+                "join_table_path": join_table_path,
+                "join_table_left_on": "jt_a_name",
+                "join_table_right_on": "jt_c_ref",
+            }
+        ],
+    )
+    xm.run()
+
+    catalog_to_c = read_catalog_to(xm, "cat_c")
+    assert catalog_to_c.height == 100
+
+    # Each C target is linked to the catalogid of the A target with the same index.
+    catalog_to_a = read_catalog_to(xm, "cat_a").select("catalogid", "a_id")
+    joined = catalog_to_c.join(catalog_to_a, on="catalogid")
+    assert (joined["c_id"] == joined["a_id"]).all()

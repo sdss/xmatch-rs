@@ -237,6 +237,44 @@ fn xmatch_phase1_join_type_table_pixel(
         right_cat_dataset.get_frame()?
     };
 
+    // If the left join column is not the primary key in the catalog_to_<left> table, we need to
+    // get it from the left catalogue before joining with the join table.
+    let left_cat_model = xmatch_data
+        .get_catalogue_model(&join_path_model.left_catalogue)
+        .unwrap();
+
+    let catalog_to_lf = if join_path_model.left_on != left_cat_model.primary_key {
+        let left_cat_dataset = Dataset::new(left_cat_model.hats_path.clone(), true);
+
+        let left_cat_lf = if use_partitioning {
+            let left_cat_pixels =
+                left_cat_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
+            if left_cat_pixels.is_empty() {
+                return Ok(());
+            }
+            left_cat_dataset.scan_pixels(left_cat_pixels)?
+        } else {
+            left_cat_dataset.get_frame()?
+        };
+
+        let left_cat_lf = left_cat_lf.select([
+            col(&left_cat_model.primary_key),
+            col(&join_path_model.left_on),
+        ]);
+
+        catalog_to_lf.join(
+            left_cat_lf,
+            [col(&left_cat_model.primary_key)],
+            [col(&left_cat_model.primary_key)],
+            JoinArgs {
+                how: JoinType::Inner,
+                ..Default::default()
+            },
+        )
+    } else {
+        catalog_to_lf
+    };
+
     // Let's do all the joins now.
     let joined_lf = catalog_to_lf
         .join(
@@ -257,36 +295,6 @@ fn xmatch_phase1_join_type_table_pixel(
                 ..Default::default()
             },
         );
-
-    // If the left join column is not the primary key in the catalog_to_<left> table, we need to
-    // handle it differently.
-    let left_cat_model = xmatch_data
-        .get_catalogue_model(&join_path_model.left_catalogue)
-        .unwrap();
-
-    let joined_lf = if join_path_model.left_on != left_cat_model.primary_key {
-        let left_cat_dataset = Dataset::new(left_cat_model.hats_path.clone(), true);
-
-        let left_cat_lf = if use_partitioning {
-            let left_cat_pixels =
-                left_cat_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
-            left_cat_dataset.scan_pixels(left_cat_pixels)?
-        } else {
-            left_cat_dataset.get_frame()?
-        };
-
-        left_cat_lf.join(
-            joined_lf,
-            [col(left_cat_model.primary_key.clone())],
-            [col(left_cat_model.primary_key.clone())],
-            JoinArgs {
-                how: JoinType::Inner,
-                ..Default::default()
-            },
-        )
-    } else {
-        joined_lf
-    };
 
     // Finally, we remove entries that were already cross-matched using previous join paths.
     let joined_lf = remove_already_xmatched(
