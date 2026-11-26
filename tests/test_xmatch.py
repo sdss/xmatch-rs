@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy
 import polars
+import pytest
 
 from .conftest import offset_coords, random_patch, read_catalog, read_catalog_to
 
@@ -261,6 +262,113 @@ def test_phase_1_multiple_join_paths(make_hats, make_xmatch, run_id, tmp_path):
     assert phase_1.height == 100
     assert phase_1.select("catalogid", "b_id").is_duplicated().sum() == 0
     assert set(phase_1["b_id"]) == set(range(1000, 1100))
+
+
+def test_delete_catalogue_with_dependents(make_hats, make_xmatch, run_id):
+    """Deleting a catalogue that later catalogues depend on requires force=True."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(100), "ra": ra, "dec": dec})
+
+    # Even B targets match A in phase 2. Odd ones are new.
+    ra_b, dec_b = offset_coords(ra, dec, 0.3)
+    _, dec_far = offset_coords(ra, dec, 30)
+    dec_b[1::2] = dec_far[1::2]
+    cat_b = polars.DataFrame({"b_id": numpy.arange(100), "ra": ra_b, "dec": dec_b})
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0)
+    xm.run()
+
+    # catalog_to_cat_b points to catalogids added by cat_a, so cat_a cannot be
+    # deleted while cat_b is there.
+    with pytest.raises(RuntimeError, match="processed after it"):
+        xm.delete_catalogue_data("cat_a")
+
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_a").height == 100
+
+    # Phase 1 and 2 deletions do not touch catalog and are allowed.
+    xm.delete_catalogue_data("cat_a", phase=1)
+
+    # Deleting the last catalogue is allowed, and then cat_a can be deleted.
+    xm.delete_catalogue_data("cat_b", delete_from_schema=True)
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_b").height == 0
+
+    xm.delete_catalogue_data("cat_a")
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_a").height == 0
+
+
+def test_delete_catalogue_force(make_hats, make_xmatch, run_id):
+    """force=True keeps the previous behaviour."""
+
+    ra, dec = random_patch(50, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(50), "ra": ra, "dec": dec})
+    ra_b, dec_b = offset_coords(ra, dec, 0.3)
+    cat_b = polars.DataFrame({"b_id": numpy.arange(50), "ra": ra_b, "dec": dec_b})
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats(
+        "cat_b",
+        cat_b,
+        "b_id",
+    )
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0, skip_phases=[3])
+    xm.run()
+
+    xm.delete_catalogue_data("cat_a", force=True)
+    assert read_catalog(xm).filter(polars.col.added_by == "cat_a").height == 0
+    assert not xm.model.get_catalogue("cat_a").complete
+
+
+def test_phase_1_left_catalogue_partial_footprint(make_hats, make_xmatch, run_id):
+    """Phase 1 works when the left catalogue does not cover all the xmatch pixels."""
+
+    ra_a, dec_a = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(100), "ra": ra_a, "dec": dec_a})
+
+    # B covers a different patch, so the catalog dataset has pixels with no
+    # catalog_to_cat_a entries.
+    ra_b, dec_b = random_patch(100, 200.0, -30.0, seed=2)
+    cat_b = polars.DataFrame({"b_id": numpy.arange(100), "ra": ra_b, "dec": dec_b})
+
+    # C links to A through a column. It also has unlinked targets in B's patch,
+    # where there are no catalog_to_cat_a entries.
+    cat_c = polars.DataFrame(
+        {
+            "c_id": numpy.arange(200),
+            "ra": numpy.concatenate([ra_a, ra_b]),
+            "dec": numpy.concatenate([dec_a, dec_b]),
+            "a_ref": numpy.concatenate([numpy.arange(100), numpy.full(100, -1)]),
+        }
+    )
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+    hats_c = make_hats("cat_c", cat_c, "c_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", skip_phases=[2])
+    xm.add_catalogue(
+        hats_c.path,
+        name="cat_c",
+        skip_phases=[2, 3],
+        join_paths=[
+            {"left_catalogue": "cat_a", "left_on": "a_id", "right_on": "a_ref"}
+        ],
+    )
+    xm.run()
+
+    catalog_to_c = read_catalog_to(xm, "cat_c")
+    assert set(catalog_to_c["c_id"]) == set(range(100))
+    assert (catalog_to_c["added_by_phase"] == 1).all()
 
 
 def test_phase_1_gaia_neighbourhood_best(make_hats, make_xmatch, run_id, tmp_path):
