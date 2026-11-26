@@ -740,6 +740,20 @@ pub fn sink_lazyframe_pixel(
     Ok(())
 }
 
+/// Sinks a lazy frame to a single Parquet file.
+pub fn sink_lazyframe_to_file(lf: LazyFrame, file_path: &Path) -> Result<()> {
+    lf.sink(
+        SinkDestination::File {
+            target: SinkTarget::Path(to_pl_path(file_path)?),
+        },
+        FileWriteFormat::Parquet(Arc::new(ParquetWriteOptions::default())),
+        UnifiedSinkArgs::default(),
+    )?
+    .collect_with_engine(Engine::Streaming)?;
+
+    Ok(())
+}
+
 /// Adds the healpix_xmatch column to a lazy frame.
 pub fn add_healpix_xmatch_column(lf: LazyFrame, xmatch_order: u8) -> Result<LazyFrame> {
     let lf = lf.with_column(
