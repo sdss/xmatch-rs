@@ -127,3 +127,45 @@ def _healpix_29_center(pixel: int) -> tuple[float, float]:
 
     theta, phi = healpy.pix2ang(2**29, pixel, nest=True)
     return float(numpy.degrees(phi)), float(90.0 - numpy.degrees(theta))
+
+
+def test_propagation_wraps_coordinates(make_hats, make_xmatch, run_id):
+    """Propagated coordinates are wrapped to the valid RA/Dec range."""
+
+    # Targets near RA=0, RA=360 and the poles, with large proper motions that move
+    # them across those boundaries between epoch 2000 and 2015.5.
+    cat_a = polars.DataFrame(
+        {
+            "a_id": numpy.arange(4),
+            "ra": [0.0001, 359.9999, 10.0, 200.0],
+            "dec": [0.0, 0.0, 89.9999, -89.9999],
+            "pmra": [-100_000.0, 100_000.0, 0.0, 0.0],
+            "pmdec": [0.0, 0.0, 100_000.0, -100_000.0],
+        }
+    )
+    hats_a = make_hats("cat_a", cat_a, "a_id", pm=True, epoch=2000.0)
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.run()
+
+    catalog = read_catalog(xm).join(
+        read_catalog_to(xm, "cat_a").select("catalogid", "a_id"),
+        on="catalogid",
+    )
+    catalog = catalog.sort("a_id")
+    assert catalog.height == 4
+
+    ra = catalog["ra"].to_numpy()
+    dec = catalog["dec"].to_numpy()
+
+    assert ((ra >= 0) & (ra < 360)).all()
+    assert ((dec >= -90) & (dec <= 90)).all()
+
+    # Crossed RA=0 westwards and RA=360 eastwards.
+    assert ra[0] > 359
+    assert ra[1] < 1
+
+    # Crossed the poles: RA is rotated by 180 degrees.
+    assert dec[2] > 89 and abs(ra[2] - 190.0) < 1e-6
+    assert dec[3] < -89 and abs(ra[3] - 20.0) < 1e-6

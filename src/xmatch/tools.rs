@@ -280,7 +280,38 @@ pub fn propagate_coordinates(
         (col("dec_epoch") + dec_diff).alias("dec_epoch"),
     ]);
 
-    Ok(cat_lf)
+    Ok(normalise_coordinates(cat_lf, "ra_epoch", "dec_epoch"))
+}
+
+/// Brings coordinates back into the valid range after propagation.
+///
+/// A Dec beyond a pole is reflected back (dec' = ±180 - dec) and RA is rotated by 180 degrees.
+/// RA is then wrapped to the range [0, 360).
+pub(crate) fn normalise_coordinates(lf: LazyFrame, ra_col: &str, dec_col: &str) -> LazyFrame {
+    let dec = col(dec_col);
+    let beyond_north = dec.clone().gt(lit(90.0));
+    let beyond_south = dec.clone().lt(lit(-90.0));
+    let beyond_pole = beyond_north.clone().or(beyond_south.clone());
+
+    let new_dec = when(beyond_north)
+        .then(lit(180.0) - dec.clone())
+        .when(beyond_south)
+        .then(lit(-180.0) - dec.clone())
+        .otherwise(dec);
+
+    let ra = when(beyond_pole)
+        .then(col(ra_col) + lit(180.0))
+        .otherwise(col(ra_col));
+
+    // Wrap to [0, 360). Proper motion offsets are much smaller than 360 degrees so a single
+    // correction is enough.
+    let new_ra = when(ra.clone().lt(lit(0.0)))
+        .then(ra.clone() + lit(360.0))
+        .when(ra.clone().gt_eq(lit(360.0)))
+        .then(ra.clone() - lit(360.0))
+        .otherwise(ra);
+
+    lf.with_columns([new_ra.alias(ra_col), new_dec.alias(dec_col)])
 }
 
 /// Move files from a temporary directory to the final path.
