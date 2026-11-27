@@ -132,35 +132,84 @@ pub struct SkyMatch {
 ///
 /// [`match_sky_radius`] allocates one vector per coordinate in `coords2`, even if it has no
 /// matches. This function only stores the matches. They are ordered by `index2` and, for each
-/// `index2`, by increasing distance, as returned by [`match_sky_radius`].
+/// `index2`, by increasing distance, as returned by [`match_sky_radius`]. Ties in distance are
+/// broken by `index1`.
+///
+/// The k-d tree is built on the smaller of the two sets of coordinates, which reduces the memory
+/// used by the tree. The distance is symmetric so the matches do not depend on which set is
+/// used to build the tree.
 ///
 pub fn match_sky_radius_flat(
     coords1: &[(f64, f64)],
     coords2: &[(f64, f64)],
     radius: f64,
 ) -> Result<Vec<SkyMatch>> {
+    let mut matches = if coords1.len() <= coords2.len() {
+        radius_search(
+            coords1,
+            coords2,
+            radius,
+            |tree_index, query_index, distance| SkyMatch {
+                index2: query_index,
+                index1: tree_index,
+                distance,
+            },
+        )?
+    } else {
+        radius_search(
+            coords2,
+            coords1,
+            radius,
+            |tree_index, query_index, distance| SkyMatch {
+                index2: tree_index,
+                index1: query_index,
+                distance,
+            },
+        )?
+    };
+
+    // Sort by index2, then by distance and index1. If the tree was built on coords1 the
+    // matches are already sorted by index2 and distance, but sorting also makes the order of
+    // ties deterministic.
+    matches.par_sort_unstable_by(|a, b| {
+        a.index2
+            .cmp(&b.index2)
+            .then(a.distance.total_cmp(&b.distance))
+            .then(a.index1.cmp(&b.index1))
+    });
+
+    Ok(matches)
+}
+
+/// Builds a k-d tree with `tree_coords` and finds all the neighbours of each coordinate in
+/// `query_coords` within `radius`. `to_match` receives the index in `tree_coords`, the index in
+/// `query_coords` and the distance, and returns the match.
+fn radius_search<F>(
+    tree_coords: &[(f64, f64)],
+    query_coords: &[(f64, f64)],
+    radius: f64,
+    to_match: F,
+) -> Result<Vec<SkyMatch>>
+where
+    F: Fn(usize, usize, f64) -> SkyMatch + Sync,
+{
     // Initialise the k-d tree.
     let mut kdtree = KdTree::new(2);
 
-    // Build the tree using the first set of coordinates.
-    for (i, coord) in coords1.iter().enumerate() {
+    for (i, coord) in tree_coords.iter().enumerate() {
         kdtree.add([coord.0, coord.1], i)?;
     }
 
-    // Rayon's collect preserves the order of the input, so the matches are sorted by index2.
-    let matches = coords2
+    let matches = query_coords
         .par_iter()
         .enumerate()
-        .flat_map_iter(|(index2, coord)| {
+        .flat_map_iter(|(query_index, coord)| {
             kdtree
                 .within(&[coord.0, coord.1], radius, &spherical_distance)
                 .unwrap()
                 .into_iter()
-                .map(move |(distance, index1)| SkyMatch {
-                    index2,
-                    index1: *index1,
-                    distance,
-                })
+                .map(|(distance, tree_index)| to_match(*tree_index, query_index, distance))
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -211,5 +260,66 @@ mod tests {
             .map(|m| (m.index2, m.index1))
             .collect::<Vec<_>>();
         assert_eq!(pairs, vec![(0, 0), (0, 1), (2, 2)]);
+    }
+
+    /// Returns pseudo-random coordinates in radians in a small patch around the RA=0 line.
+    fn random_coords(n: usize, seed: u64) -> Vec<(f64, f64)> {
+        // Simple linear congruential generator to avoid adding a dependency.
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+
+        (0..n)
+            .map(|_| {
+                // RA in [359.99, 360.01) wrapped to [0, 360), Dec in [-0.01, 0.01).
+                let ra = (359.99 + next() * 0.02) % 360.0;
+                let dec = -0.01 + next() * 0.02;
+                (ra.to_radians(), dec.to_radians())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_match_sky_radius_flat_tree_side() {
+        // The radius is large enough that each target has several neighbours.
+        let radius = (5.0f64 / 3600.0).to_radians();
+
+        let small = random_coords(500, 1);
+        let large = random_coords(3000, 2);
+
+        let expected = |coords1: &Vec<(f64, f64)>, coords2: &Vec<(f64, f64)>| {
+            let mut expected = match_sky_radius(coords1, coords2, radius)
+                .unwrap()
+                .iter()
+                .enumerate()
+                .flat_map(|(index2, matches)| {
+                    matches.iter().map(move |(distance, index1)| SkyMatch {
+                        index2,
+                        index1: *index1,
+                        distance: *distance,
+                    })
+                })
+                .collect::<Vec<_>>();
+            expected.sort_by(|a, b| {
+                a.index2
+                    .cmp(&b.index2)
+                    .then(a.distance.total_cmp(&b.distance))
+                    .then(a.index1.cmp(&b.index1))
+            });
+            expected
+        };
+
+        // Tree built on coords1 (smaller) and on coords2 (smaller).
+        for (coords1, coords2) in [(&small, &large), (&large, &small)] {
+            let flat = match_sky_radius_flat(coords1, coords2, radius).unwrap();
+            let expected = expected(coords1, coords2);
+
+            assert!(flat.len() > coords1.len().min(coords2.len()));
+            assert_eq!(flat, expected);
+        }
     }
 }
