@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import shutil
+
 import numpy
 import polars
 import pytest
@@ -932,3 +934,39 @@ def test_phase_3_pixel_columns(make_hats, make_xmatch, run_id):
 
     numpy.testing.assert_allclose(catalog["pmdec"].to_numpy(), 100.0, rtol=1e-6)
     numpy.testing.assert_allclose(catalog["parallax"].to_numpy(), parallax_b, rtol=1e-6)
+
+
+def test_phase_1_missing_left_catalog_to(make_hats, make_xmatch, run_id):
+    """A join path is skipped if catalog_to_<left> does not exist."""
+
+    ra, dec = random_patch(100, 10.0, 10.0)
+    cat_a = polars.DataFrame(
+        {
+            "a_id": numpy.arange(100),
+            "ra": ra,
+            "dec": dec,
+            "r_ref": numpy.arange(2000, 2100),
+        }
+    )
+    cat_r = polars.DataFrame({"r_id": numpy.arange(2000, 2100), "ra": ra, "dec": dec})
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_r = make_hats("cat_r", cat_r, "r_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.run()
+
+    shutil.rmtree(xm.path / "catalog_to_cat_a")
+
+    xm.add_catalogue(
+        hats_r.path,
+        name="cat_r",
+        skip_phases=[2, 3],
+        join_paths=[
+            {"left_catalogue": "cat_a", "left_on": "r_ref", "right_on": "r_id"}
+        ],
+    )
+    xm.run()
+
+    assert read_catalog_to(xm, "cat_r").height == 0

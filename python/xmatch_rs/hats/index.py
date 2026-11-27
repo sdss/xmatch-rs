@@ -83,8 +83,15 @@ def create_index(
 
     index_path.mkdir(parents=True, exist_ok=True)
 
-    # Add the extra columns to the groupby aggregation.
-    index_lf = index_lf.agg(polars.col(extra_columns).first())
+    if check_duplicates:
+        # We know there are no duplicates, so grouping would return one row per input
+        # row. Use a select instead, which streams without building a hash table of
+        # every row.
+        index_lf = lf.select(gb_cols + extra_columns)
+    else:
+        # Add the extra columns to the groupby aggregation. If there are duplicates,
+        # the first value of each extra column is kept.
+        index_lf = index_lf.agg(polars.col(extra_columns).first())
 
     if sort:
         index_lf = index_lf.sort(index_column)

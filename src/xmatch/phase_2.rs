@@ -14,7 +14,7 @@ use num_format::ToFormattedString;
 use polars::prelude::*;
 
 use crate::hats::dataset::{AsDataset, Dataset};
-use crate::knn::match_sky_radius;
+use crate::knn::match_sky_radius_flat;
 use crate::tools::{self, IsEmpty};
 use crate::xmatch::models::{
     CATALOG_TO_TABLE_SCHEMA, CatalogueModel, CoordUnit, EpochFormat, XMatchData, cast_and_reorder,
@@ -77,6 +77,28 @@ pub(crate) fn run_phase_2(xmatch_data: XMatchData) -> Result<()> {
 
     let progress_tracker = Arc::new(Mutex::new(progress_tracker));
 
+    // Create the datasets once and share them between the pixel workers, so that their
+    // partition info is only read once. None of them is modified during phase 2, which writes
+    // to a temporary directory.
+    let catalog_to_table_path =
+        xmatch_tools::get_xmatch_path(xmatch_data.path.clone(), Some(cat_model.name.clone()))?;
+
+    let xmatch_path = xmatch_tools::get_xmatch_path(xmatch_data.path.clone(), None)?;
+
+    let datasets = Phase2Datasets {
+        catalogue: cat_dataset.clone(),
+        catalog_to_table: if catalog_to_table_path.exists() {
+            Some(Dataset::new(catalog_to_table_path, false))
+        } else {
+            None
+        },
+        xmatch: if xmatch_path.exists() {
+            Some(Dataset::new(xmatch_path, false))
+        } else {
+            None
+        },
+    };
+
     // Use a quarter of the CPUs if n_workers is not specified.
     let n_workers = phase
         .n_workers
@@ -97,6 +119,7 @@ pub(crate) fn run_phase_2(xmatch_data: XMatchData) -> Result<()> {
                     pixel,
                     &xmatch_data,
                     phase.query_radius.unwrap_or(1.0f64) as f32,
+                    &datasets,
                 )
                 .unwrap();
 
@@ -206,11 +229,22 @@ pub(crate) fn run_phase_2(xmatch_data: XMatchData) -> Result<()> {
     Ok(())
 }
 
+/// Datasets used to process each pixel in phase 2.
+struct Phase2Datasets {
+    /// The HATS dataset of the catalogue being processed.
+    catalogue: Dataset,
+    /// The catalog_to_table dataset for the catalogue, if it exists.
+    catalog_to_table: Option<Dataset>,
+    /// The xmatch catalog dataset, if it exists.
+    xmatch: Option<Dataset>,
+}
+
 fn _xmatch_phase2_pixel(
     order: u8,
     pixel: u64,
     xmatch_data: &XMatchData,
     query_radius: f32,
+    datasets: &Phase2Datasets,
 ) -> Result<()> {
     let log_prefix = format!(
         "[{}] - Phase 2 -",
@@ -233,8 +267,7 @@ fn _xmatch_phase2_pixel(
     // Get the catalogue lazyframe for the pixel to process.
     let primary_key = cat_model.primary_key.clone();
 
-    let hats_dataset = Dataset::new(cat_model.hats_path.clone(), true);
-    let cat_lf = hats_dataset.scan_pixel(order, pixel, false)?;
+    let cat_lf = datasets.catalogue.scan_pixel(order, pixel, false)?;
 
     if cat_lf.is_empty() {
         log::trace!(
@@ -248,8 +281,6 @@ fn _xmatch_phase2_pixel(
 
     // Need to get the catalog_to_table frame and anti-join so that we keep only the rows in the
     // xmatch catalog table that have not been matched in phase 1.
-    let catalog_to_table_path =
-        xmatch_tools::get_xmatch_path(xmatch_data.path.clone(), Some(cat_model.name.clone()))?;
 
     // If the catalog_to_table directory does not exist (likely because phase 1 was not run or
     // didn't produce any matches), we create an empty catalog_to_table lazyframe with the
@@ -268,9 +299,7 @@ fn _xmatch_phase2_pixel(
             Field::new(primary_key.clone().into(), pk_dtype),
         ])));
 
-    let catalog_to_table_lf = if catalog_to_table_path.exists() {
-        let catalog_to_table_dataset = Dataset::new(catalog_to_table_path, false);
-
+    let catalog_to_table_lf = if let Some(catalog_to_table_dataset) = &datasets.catalog_to_table {
         let catalog_to_table_pixels =
             catalog_to_table_dataset.get_neighbours(order, pixel, true)?;
 
@@ -329,30 +358,33 @@ fn _xmatch_phase2_pixel(
         return Ok(());
     }
 
-    let cat_pk_series = if let Some(series) = cat_df.column(&primary_key)?.as_series() {
-        series
-    } else {
-        log::trace!(
-            "{} Failed to extract primary key column. This should not happen.",
-            log_prefix
-        );
-        return Ok(());
-    };
+    // Keep the primary key and the coordinates in radians, and free the catalogue frame.
+    let cat_pk_series = cat_df
+        .column(&primary_key)?
+        .as_materialized_series()
+        .clone()
+        .with_name("pk".into());
 
-    let cat_ra = cat_df.column("ra_epoch")?.f64()?.into_no_null_iter();
-    let cat_dec = cat_df.column("dec_epoch")?.f64()?.into_no_null_iter();
+    let cat_coords_rad = cat_df
+        .column("ra_epoch")?
+        .f64()?
+        .into_no_null_iter()
+        .zip(cat_df.column("dec_epoch")?.f64()?.into_no_null_iter())
+        .map(|(ra, dec)| (ra.to_radians(), dec.to_radians()))
+        .collect::<Vec<(f64, f64)>>();
 
-    let cat_coords = cat_ra.zip(cat_dec).collect::<Vec<(f64, f64)>>();
+    drop(cat_df);
 
     // Define the buffer around the xmatch pixels as the query radius (times two just in case)
     // plus the maximum proper motion offset.
     let buffer = (query_radius * 2.0) + max_pm_offset;
 
-    // Get the associated xmatch frame and coordinate vectors.
-    let xmatch_dataset = Dataset::new(
-        xmatch_tools::get_xmatch_path(xmatch_data.path.clone(), None)?,
-        false,
-    );
+    // Get the associated xmatch frame and coordinate vectors. If there is no xmatch data yet,
+    // there is nothing to match and the targets will be added in phase 3.
+    let Some(xmatch_dataset) = &datasets.xmatch else {
+        log::trace!("{} No xmatch dataset found. Skipping.", log_prefix);
+        return Ok(());
+    };
 
     // If there is no xmatch data around this pixel (e.g., the catalogue covers sky that no
     // previous catalogue covered) there is nothing to match. The targets will be added in
@@ -413,106 +445,82 @@ fn _xmatch_phase2_pixel(
         return Ok(());
     }
 
+    // Extract the columns we need from the xmatch frame and free it.
     let xmatch_cid = xmatch_df
         .column("catalogid")?
         .u64()?
         .into_no_null_iter()
         .collect::<Vec<u64>>();
 
-    let xmatch_ra = xmatch_df.column("ra")?.f64()?.into_no_null_iter();
-    let xmatch_dec = xmatch_df.column("dec")?.f64()?.into_no_null_iter();
+    let xmatch_healpix_29 = xmatch_df
+        .column("_healpix_29")?
+        .u64()?
+        .into_no_null_iter()
+        .collect::<Vec<u64>>();
 
-    let xmatch_coords = xmatch_ra.zip(xmatch_dec).collect::<Vec<(f64, f64)>>();
-
-    // Convert coordinates to radians.
-    let cat_coords_rad = cat_coords
-        .into_iter()
+    let xmatch_coords_rad = xmatch_df
+        .column("ra")?
+        .f64()?
+        .into_no_null_iter()
+        .zip(xmatch_df.column("dec")?.f64()?.into_no_null_iter())
         .map(|(ra, dec)| (ra.to_radians(), dec.to_radians()))
         .collect::<Vec<(f64, f64)>>();
 
-    let xmatch_coords_rad = xmatch_coords
-        .into_iter()
-        .map(|(ra, dec)| (ra.to_radians(), dec.to_radians()))
-        .collect::<Vec<(f64, f64)>>();
+    drop(xmatch_df);
 
-    // Calculate the cross-match between the catalogue and xmatch pixel coordinates.
-    let matches = match_sky_radius(
+    // Calculate the cross-match between the catalogue and xmatch pixel coordinates. The
+    // matches are sorted by catalogue index and, for each catalogue target, by distance.
+    let matches = match_sky_radius_flat(
         &xmatch_coords_rad,
         &cat_coords_rad,
         (query_radius / 3600.0f32).to_radians() as f64,
     )?;
 
-    let mut matched_cids: Vec<u64> = Vec::new();
-    let mut matched_distances: Vec<f64> = Vec::new();
-    let mut matched_best: Vec<bool> = Vec::new();
-    let mut matched_cat_pk_series =
-        Series::new_empty(PlSmallStr::from("pk"), cat_pk_series.dtype());
-
-    // Loop over each match. "matches" has the size of the catalogue coordinate array
-    // and each match is a vector of (distance, catalogid_index).
-    for (cat_idx, match_) in matches.iter().enumerate() {
-        if match_.is_empty() {
-            continue;
-        }
-
-        // Get the primary key for the catalogue row. We do this using series instead of vectors
-        // because we don't know the primary key data type.
-        let cat_pk = cat_pk_series.take(&UInt32Chunked::from_vec(
-            "matched_cat_pk".into(),
-            vec![cat_idx as u32].repeat(match_.len()),
-        ))?;
-        matched_cat_pk_series.extend(&cat_pk)?;
-
-        let (distances, indices): (Vec<f64>, Vec<usize>) = match_
-            .iter()
-            .map(|(distance_rad, idx)| (distance_rad.to_degrees(), *idx as usize))
-            .unzip();
-
-        let cid_vec = indices
-            .iter()
-            .map(|&idx| xmatch_cid[idx])
-            .collect::<Vec<u64>>();
-        matched_cids.extend(cid_vec);
-
-        matched_distances.extend(distances);
-
-        let mut matched_best_item = std::iter::repeat(false)
-            .take(match_.len())
-            .collect::<Vec<bool>>();
-        matched_best_item[0] = true;
-        matched_best.extend(matched_best_item);
-    }
+    drop(xmatch_coords_rad);
+    drop(cat_coords_rad);
 
     // If there are no matches, skip the pixel.
-    if matched_cids.is_empty() {
+    if matches.is_empty() {
         log::trace!("{} No matches found for this pixel. Skipping.", log_prefix);
         return Ok(());
     }
 
+    let n_matches = matches.len();
+    let mut matched_cat_idx: Vec<IdxSize> = Vec::with_capacity(n_matches);
+    let mut matched_cids: Vec<u64> = Vec::with_capacity(n_matches);
+    let mut matched_healpix_29: Vec<u64> = Vec::with_capacity(n_matches);
+    let mut matched_distances: Vec<f64> = Vec::with_capacity(n_matches);
+    let mut matched_best: Vec<bool> = Vec::with_capacity(n_matches);
+
+    // The closest xmatch target for each catalogue target (the first of its matches) is
+    // initially marked as best. set_best_per_catalogid() later keeps one best per catalogid.
+    let mut previous_cat_idx: Option<usize> = None;
+    for sky_match in matches {
+        matched_cat_idx.push(sky_match.index2 as IdxSize);
+        matched_cids.push(xmatch_cid[sky_match.index1]);
+        matched_healpix_29.push(xmatch_healpix_29[sky_match.index1]);
+        matched_distances.push(sky_match.distance.to_degrees());
+        matched_best.push(previous_cat_idx != Some(sky_match.index2));
+        previous_cat_idx = Some(sky_match.index2);
+    }
+
+    // Get the primary keys for the matched catalogue rows with a single take. We do this using
+    // series instead of vectors because we don't know the primary key data type.
+    let matched_cat_pk_series =
+        cat_pk_series.take(&IdxCa::from_vec("pk".into(), matched_cat_idx))?;
+
     // Build the catalog_to_table frame for the matched rows.
     let catalog_to_table_lf = DataFrame::new(
-        matched_cids.len(),
+        n_matches,
         vec![
             matched_cat_pk_series.into_column(),
             Series::new("catalogid".into(), matched_cids).into_column(),
+            Series::new("_healpix_29".into(), matched_healpix_29).into_column(),
             Series::new("distance".into(), matched_distances).into_column(),
             Series::new("best".into(), matched_best).into_column(),
         ],
     )?
     .lazy();
-
-    // Join with the catalog table to get the healpix_29
-    let catalog_to_table_lf = catalog_to_table_lf.join(
-        xmatch_df
-            .lazy()
-            .select([col("catalogid"), col("_healpix_29")]),
-        [col("catalogid")],
-        [col("catalogid")],
-        JoinArgs {
-            how: JoinType::Left,
-            ..Default::default()
-        },
-    );
 
     // Add other columns.
     let added_on = xmatch_tools::get_unix_timestamp_ms();
@@ -539,39 +547,30 @@ fn _xmatch_phase2_pixel(
     std::fs::create_dir_all(&tmp_path)?;
 
     // The catalog_to_table frame corresponds to the new catalogue (order, pixel) but catalog_to
-    // datasets are partitioned by xmatch order.
+    // datasets are partitioned by xmatch order. Evaluate the frame once, sorted by catalogid,
+    // and split it by xmatch pixel. The stable partition keeps the order in each pixel.
     let factor = 4u64.pow((29 - xmatch_data.model.pixelation_order) as u32);
-    let catalog_to_table_lf_xm = catalog_to_table_lf.with_column(
-        col("_healpix_29")
-            .true_div(lit(factor))
-            .cast(DataType::UInt64)
-            .alias("xmatch_pixel"),
-    );
-
-    let xmatch_pixel_df = catalog_to_table_lf_xm
-        .clone()
-        .select([col("xmatch_pixel")])
+    let catalog_to_table_df = catalog_to_table_lf
+        .with_column(
+            col("_healpix_29")
+                .true_div(lit(factor))
+                .cast(DataType::UInt64)
+                .alias("xmatch_pixel"),
+        )
+        .sort(["catalogid"], Default::default())
         .collect()?;
 
-    let mut xmatch_pixels = xmatch_pixel_df
-        .column("xmatch_pixel")?
-        .u64()?
-        .into_no_null_iter()
-        .collect::<Vec<_>>();
-    xmatch_pixels.sort_unstable();
-    xmatch_pixels.dedup();
+    for pixel_df in catalog_to_table_df.partition_by_stable(["xmatch_pixel"], true)? {
+        let xmatch_pixel = pixel_df
+            .column("xmatch_pixel")?
+            .u64()?
+            .get(0)
+            .expect("xmatch_pixel cannot be null");
 
-    for xmatch_pixel in xmatch_pixels {
-        let pixel_lf = catalog_to_table_lf_xm
-            .clone()
-            .filter(col("xmatch_pixel").eq(lit(xmatch_pixel)))
-            .drop(Selector::ByName {
-                names: Arc::new(["xmatch_pixel".into()]),
-                strict: true,
-            });
+        let pixel_df = pixel_df.drop("xmatch_pixel")?;
 
         xmatch_tools::sink_lazyframe_pixel(
-            pixel_lf.sort(["catalogid"], Default::default()),
+            pixel_df.lazy(),
             tmp_path.clone().join("dataset"),
             xmatch_data.model.pixelation_order,
             xmatch_pixel,
@@ -650,7 +649,8 @@ fn get_max_pm_offset(cat_lf: &LazyFrame, cat_model: &CatalogueModel, to_epoch: f
     let max_pm_offset = lf
         .with_columns([(ra_diff.pow(2) + dec_diff.pow(2)).sqrt().alias("pm_offset")])
         .select([max("pm_offset").alias("max_pm_offset")])
-        .collect()?
+        .collect_with_engine(Engine::Streaming)?
+        .unwrap_single()
         .column("max_pm_offset")?
         .get(0)?
         .extract::<f32>()

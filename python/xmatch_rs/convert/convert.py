@@ -380,7 +380,9 @@ def _convert_to_parquet_direct(
 
     lf.sink_parquet(output_path, **sink_parquet_kwargs)
 
-    return lazy_frame_row_count(lf)
+    # Count the rows from the Parquet metadata of the written file instead of
+    # re-scanning (and re-parsing) the source data.
+    return lazy_frame_row_count(polars.scan_parquet(output_path))
 
 
 def _process_lazy_frame(
