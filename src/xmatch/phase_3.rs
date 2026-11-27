@@ -319,12 +319,18 @@ fn xmatch_phase3_process_lf(
 ) -> Result<()> {
     let primary_key = cat_model.primary_key.clone();
 
-    let cat_lf = cat_lf.clone();
+    // Keep only the columns needed to build the catalog and catalog_to_table frames. The frame
+    // may be materialised below, and projection pushdown does not reach past that point, so
+    // without this all the catalogue columns would be loaded into memory.
+    let mut cat_lf = cat_lf.clone().select(
+        phase_3_columns(cat_model)
+            .into_iter()
+            .map(col)
+            .collect::<Vec<_>>(),
+    );
 
     // If a catalog_to_table frame is passed, use it to discard sources that are already
     // in the xmatch dataset.
-    let mut cat_lf = cat_lf.clone();
-
     if let Some(catalog_to_table_lf) = catalog_to_table_lf {
         if !catalog_to_table_lf.is_empty() {
             let primary_key = cat_model.primary_key.clone();
@@ -385,8 +391,11 @@ fn xmatch_phase3_process_lf(
 
     // This sink partitions on healpix_xmatch but the file path provider in
     // PartitionedParquetSinkOptions actually creates the Dir=/Npix= directories.
+    // The catalogids are a row index, so the frame is already sorted by catalogid and the
+    // sink maintains the row order. We do not sort it again, which for the first catalogue
+    // would mean sorting the whole catalogue.
     sink_lf_to_partitioned_parquet(
-        catalog_lf_no_pk.sort(["catalogid"], Default::default()),
+        catalog_lf_no_pk,
         &catalog_path.join(format!("Norder={}", xmatch_data.model.pixelation_order)),
         vec!["healpix_xmatch".into()],
         PartitionedParquetSinkOptions::default(),
@@ -418,14 +427,37 @@ fn xmatch_phase3_process_lf(
     let catalog_to_table_name = format!("catalog_to_{}", cat_model.name);
     let catalog_to_table_path = output_path.join(format!("{}/dataset", catalog_to_table_name));
 
+    // Already sorted by catalogid. See above.
     sink_lf_to_partitioned_parquet(
-        catalog_to_table_lf.sort(["catalogid"], Default::default()),
+        catalog_to_table_lf,
         &catalog_to_table_path.join(format!("Norder={}", xmatch_data.model.pixelation_order)),
         vec!["healpix_xmatch".into()],
         PartitionedParquetSinkOptions::default(),
     )?;
 
     Ok(())
+}
+
+/// Returns the catalogue columns used in phase 3, without duplicates.
+fn phase_3_columns(cat_model: &CatalogueModel) -> Vec<String> {
+    let candidates = [
+        Some(&cat_model.primary_key),
+        Some(&cat_model.ra_column),
+        Some(&cat_model.dec_column),
+        cat_model.pmra_column.as_ref(),
+        cat_model.pmdec_column.as_ref(),
+        cat_model.epoch_column.as_ref(),
+        cat_model.parallax_column.as_ref(),
+    ];
+
+    let mut columns: Vec<String> = vec!["_healpix_29".to_string()];
+    for column in candidates.into_iter().flatten() {
+        if !columns.contains(column) {
+            columns.push(column.clone());
+        }
+    }
+
+    columns
 }
 
 fn get_catalog_lf(

@@ -391,14 +391,6 @@ fn _xmatch_phase2_pixel(
         .drop_nans(None)
         .drop_nulls(None);
 
-    if xmatch_lf.is_empty() {
-        log::trace!(
-            "{} No unmatched xmatch data found for this pixel. Skipping.",
-            log_prefix
-        );
-        return Ok(());
-    }
-
     // Reject catalogues that should be ignored in phase 2. This is useful, for example, if we have
     // already joined with that catalogue in phase 1 and we trust that matching more than we trust
     // a spatial cross-match.
@@ -407,9 +399,19 @@ fn _xmatch_phase2_pixel(
         xmatch_lf = xmatch_lf.filter(col("added_by").neq(lit(ignore_cat.clone())));
     }
 
+    // Materialise the frame once and check its height, instead of evaluating the anti-join
+    // a second time just to check whether it is empty.
     let xmatch_df = xmatch_lf
         .collect_with_engine(Engine::Streaming)?
         .unwrap_single();
+
+    if xmatch_df.height() == 0 {
+        log::trace!(
+            "{} No unmatched xmatch data found for this pixel. Skipping.",
+            log_prefix
+        );
+        return Ok(());
+    }
 
     let xmatch_cid = xmatch_df
         .column("catalogid")?

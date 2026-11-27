@@ -38,6 +38,7 @@ def make_schema(
     pm: bool = False,
     epoch: float = 2000.0,
     parallax: bool = False,
+    epoch_column: str | None = None,
 ) -> dict[str, Any]:
     """Returns a schema dictionary for a synthetic catalogue."""
 
@@ -65,6 +66,10 @@ def make_schema(
             pmra_is_cosdec=True,
             epoch=epoch,
         )
+
+    if epoch_column is not None:
+        schema.pop("epoch", None)
+        schema["epoch_column"] = epoch_column
 
     if parallax:
         schema["parallax_column"] = "parallax"

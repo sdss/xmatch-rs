@@ -85,6 +85,22 @@ def test_get_max_catalogid_new_run_id(make_xmatch, run_id):
     assert max_catalogid == run_id << RUN_ID_BIT_SHIFT
 
 
+def test_get_max_catalogid_run_id_boundaries(make_xmatch, run_id):
+    """Only catalogids in the bit range of the run_id are considered."""
+
+    base = run_id << RUN_ID_BIT_SHIFT
+    next_base = (run_id + 1) << RUN_ID_BIT_SHIFT
+
+    xm = make_xmatch()
+
+    # The largest catalogid for run_id, the first one for the next run_id (which is
+    # the global maximum), and the last one for the previous run_id.
+    write_catalog(xm, [base, next_base - 1, next_base, base - 1])
+
+    max_catalogid = xmatch_lib.get_max_catalogid(str(xm.path), run_id)
+    assert max_catalogid == next_base - 1
+
+
 BUILD_XMATCH_SCRIPT = """
 import sys
 from xmatch_rs.xmatch.xmatch import XMatch

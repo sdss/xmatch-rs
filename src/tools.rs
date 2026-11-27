@@ -37,7 +37,16 @@ pub trait IsEmpty {
 
 impl IsEmpty for LazyFrame {
     fn is_empty(&self) -> bool {
-        self.clone().limit(1).collect().unwrap().height() == 0
+        // Use the streaming engine so that the query can stop as soon as one row is produced.
+        // With the in-memory engine, any join in the plan is fully materialised before the
+        // limit is applied.
+        self.clone()
+            .limit(1)
+            .collect_with_engine(Engine::Streaming)
+            .unwrap()
+            .unwrap_single()
+            .height()
+            == 0
     }
 }
 
