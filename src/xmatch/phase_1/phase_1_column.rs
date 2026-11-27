@@ -314,16 +314,8 @@ fn xmatch_phase1_join_type_column_pixel(
         lit(added_on).alias("added_on"),
     ]);
 
-    // If the resulting lazy frame has no rows, exit early.
-    if lf.is_empty() {
-        log::trace!(
-            "{} ({}, {}): no rows after join, skipping.",
-            log_prefix,
-            xmatch_order,
-            xmatch_pixel,
-        );
-        return Ok(());
-    }
+    // We do not check whether the join is empty here. The row count below covers that case
+    // and evaluating the join an extra time is expensive for large frames.
 
     // This lazy frame may include rows with catalogids that are already in catalog_to_<right>
     // from a different join path. We remove those if they exist.

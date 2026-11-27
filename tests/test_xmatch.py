@@ -12,7 +12,13 @@ import numpy
 import polars
 import pytest
 
-from .conftest import offset_coords, random_patch, read_catalog, read_catalog_to
+from .conftest import (
+    XMATCH_EPOCH,
+    offset_coords,
+    random_patch,
+    read_catalog,
+    read_catalog_to,
+)
 
 
 def test_first_catalogue_phase_3(make_hats, make_xmatch, run_id):
@@ -828,3 +834,101 @@ def test_propagation_wraps_coordinates(make_hats, make_xmatch, run_id):
     # Crossed the poles: RA is rotated by 180 degrees.
     assert dec[2] > 89 and abs(ra[2] - 190.0) < 1e-6
     assert dec[3] < -89 and abs(ra[3] - 20.0) < 1e-6
+
+
+def _assert_files_sorted_by_catalogid(path):
+    """Asserts that each Parquet file under ``path`` is sorted by catalogid."""
+
+    files = list(path.rglob("*.parquet"))
+    assert len(files) > 0
+
+    for file in files:
+        catalogid = polars.read_parquet(file, columns=["catalogid"])["catalogid"]
+        assert catalogid.is_sorted(), f"{file} is not sorted by catalogid."
+
+
+def test_phase_3_files_sorted_by_catalogid(make_hats, make_xmatch, run_id):
+    """The catalog and catalog_to files written in phase 3 are sorted by catalogid."""
+
+    ra, dec = random_patch(400, 10.0, 10.0, size=2.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(400), "ra": ra, "dec": dec})
+
+    # Odd B targets are new and are added in phase 3 using the per-pixel path.
+    ra_b, dec_b = offset_coords(ra, dec, 0.3)
+    _, dec_far = offset_coords(ra, dec, 30)
+    dec_b[1::2] = dec_far[1::2]
+    cat_b = polars.DataFrame({"b_id": numpy.arange(400), "ra": ra_b, "dec": dec_b})
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats("cat_b", cat_b, "b_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0)
+    xm.run()
+
+    _assert_files_sorted_by_catalogid(xm.path / "catalog" / "dataset")
+    _assert_files_sorted_by_catalogid(xm.path / "catalog_to_cat_a" / "dataset")
+
+    # catalog_to_cat_b also has the phase 2 files, which are sorted separately.
+    catalog_to_b = read_catalog_to(xm, "cat_b").filter(polars.col.added_by_phase == 3)
+    assert catalog_to_b.height == 200
+    for file in (xm.path / "catalog_to_cat_b" / "dataset").rglob("*.parquet"):
+        df = polars.read_parquet(file, columns=["catalogid", "added_by_phase"])
+        assert df.filter(polars.col.added_by_phase == 3)["catalogid"].is_sorted()
+
+
+def test_phase_3_pixel_columns(make_hats, make_xmatch, run_id):
+    """Phase 3 on a second catalogue uses the pm, epoch and parallax columns."""
+
+    ra, dec = random_patch(200, 10.0, 10.0)
+    cat_a = polars.DataFrame({"a_id": numpy.arange(200), "ra": ra, "dec": dec})
+
+    # B targets are all far from A, so all are added in phase 3. B has a per-row
+    # epoch and extra columns that phase 3 does not need.
+    ra_b, dec_b = offset_coords(ra, dec, 30)
+    epoch_b = numpy.where(numpy.arange(200) % 2 == 0, 2000.0, 2010.0)
+    parallax_b = numpy.linspace(0.1, 10.0, 200)
+    cat_b = polars.DataFrame(
+        {
+            "b_id": numpy.arange(200),
+            "ra": ra_b,
+            "dec": dec_b,
+            "pmra": numpy.zeros(200),
+            "pmdec": numpy.full(200, 100.0),
+            "ref_epoch": epoch_b,
+            "parallax": parallax_b,
+            "extra_float": numpy.arange(200) * 1.5,
+            "extra_str": [f"target_{ii}" for ii in range(200)],
+        }
+    )
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_b = make_hats(
+        "cat_b",
+        cat_b,
+        "b_id",
+        pm=True,
+        epoch_column="ref_epoch",
+        parallax=True,
+    )
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(hats_b.path, name="cat_b", query_radius=1.0)
+    xm.run()
+
+    catalog = read_catalog(xm).filter(polars.col.added_by == "cat_b")
+    catalog = catalog.join(
+        read_catalog_to(xm, "cat_b").select("catalogid", "b_id"),
+        on="catalogid",
+    ).sort("b_id")
+    assert catalog.height == 200
+
+    # Propagation uses the per-row epoch: 15.5 or 5.5 years at 100 mas/yr in Dec.
+    expected_dec = dec_b + (XMATCH_EPOCH - epoch_b) * 100.0 / 1000.0 / 3600.0
+    numpy.testing.assert_allclose(catalog["dec"].to_numpy(), expected_dec, atol=1e-9)
+    numpy.testing.assert_allclose(catalog["ra"].to_numpy(), ra_b, atol=1e-9)
+
+    numpy.testing.assert_allclose(catalog["pmdec"].to_numpy(), 100.0, rtol=1e-6)
+    numpy.testing.assert_allclose(catalog["parallax"].to_numpy(), parallax_b, rtol=1e-6)

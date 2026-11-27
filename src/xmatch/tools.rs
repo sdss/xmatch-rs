@@ -127,25 +127,22 @@ pub fn get_max_catalogid(
             return Ok(max_catalogid);
         }
 
-        // Calculate the maximum catalogid for the given run_id.
+        // Calculate the maximum catalogid for the given run_id. The catalogids for a run_id are
+        // the range [run_id << RUN_ID_BIT_SHIFT, (run_id + 1) << RUN_ID_BIT_SHIFT). Filtering
+        // on that range with native expressions allows the query to be streamed and Parquet
+        // statistics to be used to skip row groups, instead of loading the whole column.
+        let (min_cid, max_cid_exclusive) = run_id_catalogid_range(run_id as u64);
+
+        let mut range_filter = col("catalogid").gt_eq(lit(min_cid));
+        if let Some(max_cid_exclusive) = max_cid_exclusive {
+            range_filter = range_filter.and(col("catalogid").lt(lit(max_cid_exclusive)));
+        }
+
         let max_cid_df = lf
-            .with_columns([col("catalogid")
-                .map(
-                    |column| {
-                        let run_id = column
-                            .u64()?
-                            .apply_values(|value| value >> RUN_ID_BIT_SHIFT)
-                            .into_series()
-                            .with_name(PlSmallStr::from("run_id"))
-                            .into_column();
-                        Ok(run_id)
-                    },
-                    |_, _| Ok(Field::new("run_id".into(), DataType::UInt64)),
-                )
-                .alias("run_id")])
-            .filter(col("run_id").eq(lit(run_id as u64)))
+            .filter(range_filter)
             .select([col("catalogid").max()])
-            .collect()?;
+            .collect_with_engine(Engine::Streaming)?
+            .unwrap_single();
 
         // If there are no catalogids for this run_id, the max() aggregation returns a single
         // null value, which we handle below.
@@ -163,7 +160,8 @@ pub fn get_max_catalogid(
         // Just return the maximum catalogid.
         let max_catalogid = lf
             .select([col("catalogid").max()])
-            .collect()?
+            .collect_with_engine(Engine::Streaming)?
+            .unwrap_single()
             .column("catalogid")?
             .u64()?
             .get(0)
@@ -171,6 +169,21 @@ pub fn get_max_catalogid(
 
         Ok(max_catalogid)
     }
+}
+
+/// Returns the range of catalogids that belong to a run_id as `(min, max_exclusive)`.
+///
+/// `max_exclusive` is `None` for the last possible run_id, whose range extends to `u64::MAX`.
+fn run_id_catalogid_range(run_id: u64) -> (u64, Option<u64>) {
+    let min_cid = run_id << RUN_ID_BIT_SHIFT;
+    let max_cid_exclusive = (run_id + 1).checked_shl(RUN_ID_BIT_SHIFT as u32);
+
+    // checked_shl only fails if the shift is too large, not if bits overflow, so we need to
+    // check that the shifted value did not wrap.
+    let max_cid_exclusive =
+        max_cid_exclusive.filter(|value| (*value >> RUN_ID_BIT_SHIFT) == run_id + 1);
+
+    (min_cid, max_cid_exclusive)
 }
 
 /// Adds a `catalogid` column to the input `LazyFrame`.
@@ -825,4 +838,25 @@ pub(crate) fn should_skip(xmatch_data: &XMatchData, phase: usize) -> bool {
     }
 
     phase.unwrap().skip
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_id_catalogid_range() {
+        assert_eq!(run_id_catalogid_range(0), (0, Some(1 << RUN_ID_BIT_SHIFT)));
+        assert_eq!(
+            run_id_catalogid_range(5),
+            (5 << RUN_ID_BIT_SHIFT, Some(6 << RUN_ID_BIT_SHIFT))
+        );
+
+        // The last run_id (11 bits) extends to u64::MAX.
+        let last_run_id = (1u64 << (64 - RUN_ID_BIT_SHIFT)) - 1;
+        assert_eq!(
+            run_id_catalogid_range(last_run_id),
+            (last_run_id << RUN_ID_BIT_SHIFT, None)
+        );
+    }
 }
