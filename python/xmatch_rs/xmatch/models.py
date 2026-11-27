@@ -476,8 +476,12 @@ class JoinPathModel(BaseModel):
         Field(
             description="The type of join table. Only required if join_type is "
             "'join_table'. Accepted values are null for a normal join table, "
-            "'gaia_neighbourhood', or 'gaia_best_neighbour'. The details of the join "
-            "may change depending on the type of join table used."
+            "'gaia_neighbourhood', or 'gaia_best_neighbour'. For the Gaia types, "
+            "a target may be matched to several catalogids and only one is marked "
+            "as best: the one with the highest 'score' for 'gaia_neighbourhood' and "
+            "the one with the smallest 'angular_distance' for 'gaia_best_neighbour' "
+            "(ties are broken by the lowest catalogid). The join table must contain "
+            "that column."
         ),
     ] = None
 

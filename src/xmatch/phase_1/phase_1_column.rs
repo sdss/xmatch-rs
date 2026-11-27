@@ -7,6 +7,8 @@
 
 use anyhow::{Result, bail};
 use polars::prelude::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread::available_parallelism;
 
@@ -33,6 +35,9 @@ pub(crate) struct Phase1Datasets {
     /// The HATS dataset of the left catalogue. Only needed (and created) if the left join column
     /// is not the left primary key.
     pub(crate) left_cat: Option<Dataset>,
+    /// Snapshot of the associations written by previous join paths, used to remove targets
+    /// that were already cross-matched. `None` if there are no previous associations.
+    pub(crate) already_xmatched: Option<AlreadyXMatched>,
 }
 
 impl Phase1Datasets {
@@ -75,7 +80,97 @@ impl Phase1Datasets {
             right_cat: Dataset::new(right_cat_model.hats_path.clone(), true),
             catalog_to_left: Dataset::new(catalog_to_left_path, false),
             left_cat,
+            already_xmatched: AlreadyXMatched::new(xmatch_data)?,
         }))
+    }
+}
+
+/// Snapshot of the temporary `catalog_to_<right>` dataset taken before a join path is processed.
+///
+/// The pixel workers of a join path write their associations to the same temporary dataset that
+/// is used to remove the targets already cross-matched by previous join paths. Listing that
+/// dataset while it is being written is racy (a pixel directory may exist before any parquet
+/// file has been written to it), so we record the partition and the list of parquet files once,
+/// before the workers start, and only read those files.
+pub(crate) struct AlreadyXMatched {
+    dataset: Dataset,
+    files: HashMap<(u8, u64), Vec<PathBuf>>,
+}
+
+impl AlreadyXMatched {
+    /// Takes the snapshot. Returns `None` if no previous join path wrote any associations.
+    fn new(xmatch_data: &XMatchData) -> Result<Option<Self>> {
+        let right_cat_model = xmatch_data
+            .get_catalogue_model(xmatch_data.catalogue_name.as_str())
+            .unwrap();
+
+        // This must match the path where write_catalog_to_table() writes the temporary files.
+        let catalog_to_right_path = xmatch::tools::get_temp_dir_path(
+            xmatch_data.path.clone(),
+            &right_cat_model.name,
+            &xmatch_data.model.version,
+            right_cat_model.run_id as usize,
+            false,
+        )?
+        .join(format!("catalog_to_{}", right_cat_model.name))
+        .join("dataset");
+
+        if !catalog_to_right_path.exists() {
+            return Ok(None);
+        }
+
+        // The partition info is cached in the dataset, so later calls to get_neighbours()
+        // won't see pixels added by the current join path.
+        let dataset = Dataset::new(catalog_to_right_path, false);
+
+        let mut files: HashMap<(u8, u64), Vec<PathBuf>> = HashMap::new();
+        for (order, pixel) in dataset.partition() {
+            let pattern = dataset.get_pixel_path(order, pixel)?.join("*.parquet");
+            let mut pixel_files = glob::glob(pattern.to_str().unwrap())?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if pixel_files.is_empty() {
+                continue;
+            }
+            pixel_files.sort();
+            files.insert((order, pixel), pixel_files);
+        }
+
+        if files.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self { dataset, files }))
+    }
+
+    /// Scans the snapshot files for a pixel and its neighbours, or all the files if no pixel is
+    /// given. Returns `None` if there are no files to scan.
+    fn scan(&self, xmatch_order_pixel: Option<(u8, u64)>) -> Result<Option<LazyFrame>> {
+        let pixels = if let Some((xmatch_order, xmatch_pixel)) = xmatch_order_pixel {
+            // Include the neighbours since the same target may have been associated with a
+            // catalogid in an adjacent pixel.
+            self.dataset
+                .get_neighbours(xmatch_order, xmatch_pixel, true)?
+        } else {
+            self.files.keys().copied().collect()
+        };
+
+        let frames = pixels
+            .iter()
+            .filter_map(|pixel| self.files.get(pixel))
+            .flatten()
+            .map(|file| {
+                Ok(LazyFrame::scan_parquet(
+                    tools::to_pl_path(file)?,
+                    Default::default(),
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if frames.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(concat(frames, UnionArgs::default())?))
     }
 }
 
@@ -386,7 +481,7 @@ fn xmatch_phase1_join_type_column_pixel(
     // from a different join path. We remove those if they exist.
     // TODO: Better than removing them, it would be good to check that they are the same
     // associations and if they are not, do something nuanced.
-    let lf = remove_already_xmatched(lf, "pk", xmatch_order_pixel, xmatch_data)?;
+    let lf = remove_already_xmatched(lf, "pk", xmatch_order_pixel, xmatch_data, datasets)?;
 
     let lf_nrows = tools::lf_row_count(&lf)?;
 
@@ -427,45 +522,25 @@ fn xmatch_phase1_join_type_column_pixel(
 /// `lf` is the frame of new associations, which must contain a `catalogid` column and the
 /// primary key of the catalogue being processed in a column named `pk_column`. Rows are removed
 /// if their catalogid or their primary key are already present in the temporary
-/// `catalog_to_<right>` dataset written by the previous join paths. Earlier join paths
-/// therefore take priority.
+/// `catalog_to_<right>` dataset written by the previous join paths (as recorded in
+/// `datasets.already_xmatched`). Earlier join paths therefore take priority.
 pub(crate) fn remove_already_xmatched(
     lf: LazyFrame,
     pk_column: &str,
     xmatch_order_pixel: Option<(u8, u64)>,
     xmatch_data: &XMatchData,
+    datasets: &Phase1Datasets,
 ) -> Result<LazyFrame> {
     let right_cat_model = xmatch_data
         .get_catalogue_model(xmatch_data.catalogue_name.as_str())
         .unwrap();
 
-    // This must match the path where write_catalog_to_table() writes the temporary files.
-    let catalog_to_right_path = xmatch::tools::get_temp_dir_path(
-        xmatch_data.path.clone(),
-        &right_cat_model.name,
-        &xmatch_data.model.version,
-        right_cat_model.run_id as usize,
-        false,
-    )?
-    .join(format!("catalog_to_{}", right_cat_model.name))
-    .join("dataset");
-
-    if !catalog_to_right_path.exists() {
+    let Some(already_xmatched) = &datasets.already_xmatched else {
         return Ok(lf);
-    }
+    };
 
-    let catalog_to_right_dataset = Dataset::new(catalog_to_right_path, false);
-
-    let catalog_to_right_lf = if let Some((xmatch_order, xmatch_pixel)) = xmatch_order_pixel {
-        // Include the neighbours since the same target may have been associated with a
-        // catalogid in an adjacent pixel.
-        let pixels = catalog_to_right_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
-        if pixels.is_empty() {
-            return Ok(lf);
-        }
-        catalog_to_right_dataset.scan_pixels(pixels)?
-    } else {
-        catalog_to_right_dataset.get_frame()?
+    let Some(catalog_to_right_lf) = already_xmatched.scan(xmatch_order_pixel)? else {
+        return Ok(lf);
     };
 
     let right_pk = right_cat_model.primary_key.clone();

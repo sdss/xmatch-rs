@@ -16,6 +16,7 @@ import pytest
 
 from .conftest import (
     XMATCH_EPOCH,
+    XMATCH_ORDER,
     offset_coords,
     random_patch,
     read_catalog,
@@ -445,6 +446,108 @@ def test_phase_1_gaia_neighbourhood_best(make_hats, make_xmatch, run_id, tmp_pat
     catalog_to_a = read_catalog_to(xm, "cat_a").select("catalogid", "a_id")
     best_a_id = best.join(catalog_to_a, on="catalogid").sort("c_id")["a_id"]
     assert (best_a_id == 2 * numpy.arange(100) + 1).all()
+
+
+@pytest.mark.parametrize(
+    "join_table_type, ranking_column, ranking_values",
+    [
+        ("gaia_neighbourhood", "score", [0.5, 0.9]),
+        ("gaia_best_neighbour", "angular_distance", [2.0, 1.0]),
+    ],
+)
+def test_phase_1_gaia_join_table_best_across_pixels(
+    make_hats,
+    make_xmatch,
+    run_id,
+    tmp_path,
+    join_table_type,
+    ranking_column,
+    ranking_values,
+):
+    """The best candidate is unique when candidates are in different xmatch pixels."""
+
+    import healpy
+
+    # C targets along a line of constant Dec, each with two A neighbours 10 arcsec apart
+    # in Dec. Keep only targets whose neighbours fall in different xmatch pixels.
+    ra = numpy.linspace(5.0, 15.0, 20000)
+    dec = numpy.full_like(ra, 10.0)
+    dec_lo = dec - 5 / 3600.0
+    dec_hi = dec + 5 / 3600.0
+
+    nside = 2**XMATCH_ORDER
+    pix_lo = healpy.ang2pix(nside, ra, dec_lo, nest=True, lonlat=True)
+    pix_hi = healpy.ang2pix(nside, ra, dec_hi, nest=True, lonlat=True)
+    straddle = pix_lo != pix_hi
+    assert straddle.sum() >= 5
+
+    ra = ra[straddle]
+    dec_lo = dec_lo[straddle]
+    dec_hi = dec_hi[straddle]
+    n_c = len(ra)
+
+    # A[2i] is below and A[2i+1] above C[i]. A[2i+1] has the best ranking value.
+    ra_a = numpy.repeat(ra, 2)
+    dec_a = numpy.empty(2 * n_c)
+    dec_a[0::2] = dec_lo
+    dec_a[1::2] = dec_hi
+    cat_a = polars.DataFrame({"a_id": numpy.arange(2 * n_c), "ra": ra_a, "dec": dec_a})
+
+    cat_c = polars.DataFrame(
+        {
+            "c_id": numpy.arange(n_c),
+            "ra": ra,
+            "dec": dec_lo + 5 / 3600.0,
+            "c_ref": numpy.arange(n_c),
+        }
+    )
+
+    join_table_path = tmp_path / "neighbourhood"
+    join_table_path.mkdir()
+    polars.DataFrame(
+        {
+            "jt_a_id": numpy.arange(2 * n_c),
+            "jt_c_id": numpy.repeat(numpy.arange(n_c), 2),
+            ranking_column: numpy.tile(ranking_values, n_c),
+        }
+    ).write_parquet(join_table_path / "join.parquet")
+
+    hats_a = make_hats("cat_a", cat_a, "a_id")
+    hats_c = make_hats("cat_c", cat_c, "c_id")
+
+    xm = make_xmatch()
+    xm.add_catalogue(hats_a.path, name="cat_a", run_id=run_id)
+    xm.add_catalogue(
+        hats_c.path,
+        name="cat_c",
+        skip_phases=[2, 3],
+        join_paths=[
+            {
+                "join_type": "join_table",
+                "join_table_type": join_table_type,
+                "left_catalogue": "cat_a",
+                "left_on": "a_id",
+                "right_on": "c_ref",
+                "join_table_path": join_table_path,
+                "join_table_left_on": "jt_a_id",
+                "join_table_right_on": "jt_c_id",
+            }
+        ],
+    )
+    xm.run()
+
+    # Each candidate is written once and only one of them is best for each C target.
+    catalog_to_c = read_catalog_to(xm, "cat_c")
+    assert catalog_to_c.height == 2 * n_c
+    assert catalog_to_c["catalogid"].n_unique() == 2 * n_c
+
+    best = catalog_to_c.filter(polars.col.best)
+    assert best.height == n_c
+    assert set(best["c_id"]) == set(range(n_c))
+
+    catalog_to_a = read_catalog_to(xm, "cat_a").select("catalogid", "a_id")
+    best_a_id = best.join(catalog_to_a, on="catalogid").sort("c_id")["a_id"]
+    assert (best_a_id == 2 * numpy.arange(n_c) + 1).all()
 
 
 def test_phase_1_join_table_left_on_not_pk(make_hats, make_xmatch, run_id, tmp_path):
