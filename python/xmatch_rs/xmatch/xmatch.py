@@ -869,7 +869,7 @@ class XMatch:
             cat_hats = HATS(cat.hats_path)
             cat_lf = cat_hats.get_as_lazyframe()
 
-            n_rows = cat_lf.select(polars.len()).collect().item()
+            n_rows = cat_lf.select(polars.len()).collect(engine="streaming").item()
             cat_data["n_rows"] = n_rows
 
             catalog_to_lf = polars.scan_parquet(
@@ -885,7 +885,7 @@ class XMatch:
                 entries = (
                     catalog_to_lf.filter((polars.col.added_by_phase == phase.phase))
                     .select(polars.len())
-                    .collect()
+                    .collect(engine="streaming")
                     .item()
                 )
                 cat_data[f"{phase_prefix}_entries"] = entries
@@ -895,10 +895,8 @@ class XMatch:
                         (polars.col.added_by_phase == phase.phase),
                         polars.col.best,
                     )
-                    .select(polars.col(cat.primary_key))
-                    .unique()
-                    .select(polars.len())
-                    .collect()
+                    .select(polars.col(cat.primary_key).n_unique())
+                    .collect(engine="streaming")
                     .item()
                 )
                 cat_data[f"{phase_prefix}_matched"] = matches

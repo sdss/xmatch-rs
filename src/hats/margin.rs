@@ -134,6 +134,10 @@ pub fn create_margin_cache(
     // Determine the number of workers to use.
     let n_workers = options.n_workers.unwrap_or(1);
 
+    // Create the object dataset once and share it between the workers, so that its partition
+    // info is only read once.
+    let dataset = Dataset::new(hats_tools::get_dataset_directory(&object_dataset)?, true);
+
     // Run the margin cache creation in parallel for each pixel.
     let pool = crate::tools::create_pool(Some(n_workers))?;
     pool.install(|| {
@@ -144,7 +148,7 @@ pub fn create_margin_cache(
             let progress_file_clone = progress_file.clone();
 
             create_margin_cache_pixel(
-                object_dataset.clone(),
+                &dataset,
                 margin_cache_path.clone(),
                 norder,
                 npix,
@@ -374,7 +378,7 @@ pub fn get_margin_bmoc(norder: u8, npix: u64, buffer: f32, moc_order: Option<u8>
 /// Creates the margin cache for a single pixel.
 ///
 /// # Arguments
-/// * `object_dataset` - The path to the object dataset.
+/// * `dataset` - The object dataset.
 /// * `output_path` - The path to the margin cache output directory.
 /// * `norder` - The HEALPix order of the pixel.
 /// * `npix` - The HEALPix pixel number.
@@ -383,7 +387,7 @@ pub fn get_margin_bmoc(norder: u8, npix: u64, buffer: f32, moc_order: Option<u8>
 ///     of the margin cache creation.
 ///
 fn create_margin_cache_pixel(
-    object_dataset: PathBuf,
+    dataset: &Dataset,
     output_path: PathBuf,
     norder: u8,
     npix: u64,
@@ -394,10 +398,9 @@ fn create_margin_cache_pixel(
     let bmoc = get_margin_bmoc(norder, npix, buffer, None);
 
     // Get the object dataset path.
-    let object_dataset_path = hats_tools::get_dataset_directory(&object_dataset)?;
+    let object_dataset_path = dataset.path();
 
     // Get the neighbours to the cell in the HATS dataset partition.
-    let dataset = Dataset::new(object_dataset_path.clone(), true);
     let neighbours = dataset.get_neighbours(norder, npix, false)?;
 
     // Iterate over the neighbours and collect the targets that fall within the margin.

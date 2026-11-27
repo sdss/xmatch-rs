@@ -241,16 +241,21 @@ def calculate_max_proper_motion(
     # Get maximum proper motion per year.
     pmra_is_cosdec = schema.model.pmra_is_cosdec
 
+    pm_columns = {
+        "dec_rad": polars.col(schema.model.dec_column).radians(),
+        "pmra_rad": polars.col(schema.model.pmra_column).radians() / 1000 / 3600,
+        "pmdec_rad": polars.col(schema.model.pmdec_column).radians() / 1000 / 3600,
+    }
+
+    if ref_epoch_column is not None:
+        # Keep the reference epoch column for the per-row epoch difference.
+        ref_epoch_expr = polars.col(ref_epoch_column).cast(polars.Float64)
+        if ref_epoch_format == EpochFormat.JD:
+            ref_epoch_expr = (ref_epoch_expr - 2451545) / 365.25 + 2000
+        pm_columns["ref_epoch"] = ref_epoch_expr
+
     lf = hats.get_as_lazyframe()
-    lf_pm = (
-        lf.select(
-            dec_rad=polars.col(schema.model.dec_column).radians(),
-            pmra_rad=polars.col(schema.model.pmra_column).radians() / 1000 / 3600,
-            pmdec_rad=polars.col(schema.model.pmdec_column).radians() / 1000 / 3600,
-        )
-        .drop_nulls()
-        .drop_nans()
-    )
+    lf_pm = lf.select(**pm_columns).drop_nulls().drop_nans()
 
     if pmra_is_cosdec is False:
         lf_pm = lf_pm.with_columns(
@@ -277,6 +282,13 @@ def calculate_max_proper_motion(
     if percentile >= 100.0:
         percentile = 100.0
 
+    def _reduce(column: str) -> polars.Expr:
+        # max() is a streaming reduction while quantile() needs the whole column
+        # in memory, so only use the latter when a lower percentile is requested.
+        if percentile == 100.0:
+            return polars.col(column).max()
+        return polars.col(column).quantile(percentile / 100.0)
+
     if epoch is None or ref_epoch_column is None:
         if epoch is not None:
             if ref_epoch is None:
@@ -286,9 +298,7 @@ def calculate_max_proper_motion(
                     f"Epoch {epoch} is before catalogue reference epoch {ref_epoch}."
                 )
 
-        max_pm = lf_pm.select(
-            polars.col.pm_total_deg.quantile(percentile / 100.0)
-        ).collect(engine="streaming")
+        max_pm = lf_pm.select(_reduce("pm_total_deg")).collect(engine="streaming")
         max_pm = float(max_pm.item())
 
         if epoch is None:
@@ -299,10 +309,15 @@ def calculate_max_proper_motion(
             return max_pm * epoch_diff
 
     assert ref_epoch_column is not None
+    assert epoch is not None
 
+    # The epoch difference is computed per row since each target can have its own
+    # reference epoch. Use the absolute value since the buffer is a distance.
     max_pm = (
-        lf_pm.select(pm_epoch=polars.col(ref_epoch_column) * polars.col.pm_total_deg)
-        .select(max_pm_epoch=polars.col.pm_epoch.quantile(percentile / 100.0))
+        lf_pm.select(
+            pm_epoch=(epoch - polars.col.ref_epoch).abs() * polars.col.pm_total_deg
+        )
+        .select(max_pm_epoch=_reduce("pm_epoch"))
         .collect(engine="streaming")
     )
 

@@ -295,6 +295,7 @@ def _write_pixel_to_database(
     schema: str,
     table_name: str,
     load_hats_columns: bool,
+    chunk_size: int = 1_000_000,
 ) -> None:
     """Writes a single pixel to the database. This is used for multiprocessing."""
 
@@ -303,7 +304,9 @@ def _write_pixel_to_database(
 
     pixel_path = get_pixel_path(dataset_path, norder, npix)
 
-    data = polars.read_parquet(pixel_path)
+    # Scan the pixel and write it in batches to avoid loading the whole pixel
+    # into memory at once.
+    data = polars.scan_parquet(pixel_path)
 
     if load_hats_columns:
         data = data.rename({"_healpix_29": "healpix_29"})
@@ -315,12 +318,13 @@ def _write_pixel_to_database(
     else:
         data = data.drop(["_healpix_29"])
 
-    data.write_database(
-        table_name=f"{schema}.{table_name}",
-        connection=database_uri,
-        if_table_exists="append",
-        engine="adbc",
-    )
+    for df in data.collect_batches(chunk_size=chunk_size):
+        df.write_database(
+            table_name=f"{schema}.{table_name}",
+            connection=database_uri,
+            if_table_exists="append",
+            engine="adbc",
+        )
 
 
 def write_parquet_to_database(

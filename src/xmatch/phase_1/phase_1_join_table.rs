@@ -16,7 +16,9 @@ use crate::xmatch;
 use crate::xmatch::models::{JoinDirection, JoinPathModel, JoinPathTableType, XMatchData};
 use crate::xmatch::tools::get_xmatch_path;
 
-use super::phase_1_column::{RIGHT_ON_COLUMN, RIGHT_PK_COLUMN, remove_already_xmatched};
+use super::phase_1_column::{
+    Phase1Datasets, RIGHT_ON_COLUMN, RIGHT_PK_COLUMN, remove_already_xmatched,
+};
 
 // Process one join path on the primary key.
 // Here "left" is the catalogue that has already been cross-matched and "right" is the
@@ -82,7 +84,10 @@ pub(crate) fn xmatch_phase1_join_type_table(
 
         // Call the "pixel" function without a pixel, which will process all the joins without
         // partitioning.
-        xmatch_phase1_join_type_table_pixel(None, xmatch_data, join_path_model).unwrap();
+        let Some(datasets) = Phase1Datasets::new(xmatch_data, join_path_model)? else {
+            return Ok(());
+        };
+        xmatch_phase1_join_type_table_pixel(None, xmatch_data, join_path_model, &datasets).unwrap();
         return Ok(());
     }
 
@@ -93,6 +98,10 @@ pub(crate) fn xmatch_phase1_join_type_table(
     );
     let xmatch_partition_info = xmatch_dataset.partition();
     let n_pixels = xmatch_partition_info.len() as u64;
+
+    let Some(datasets) = Phase1Datasets::new(xmatch_data, join_path_model)? else {
+        return Ok(());
+    };
 
     // Prepare a progress tracker.
     let progress_tracker = if let Some(progress_file) = &xmatch_data.options.progress_file {
@@ -132,6 +141,7 @@ pub(crate) fn xmatch_phase1_join_type_table(
                     Some((xmatch_order, xmatch_pixel)),
                     xmatch_data,
                     join_path_model,
+                    &datasets,
                 )
                 .unwrap();
 
@@ -157,6 +167,7 @@ fn xmatch_phase1_join_type_table_pixel(
     xmatch_order_pixel: Option<(u8, u64)>,
     xmatch_data: &XMatchData,
     join_path_model: &JoinPathModel,
+    datasets: &Phase1Datasets,
 ) -> Result<()> {
     let log_prefix = format!(
         "[{}] - Phase 1 -",
@@ -185,13 +196,7 @@ fn xmatch_phase1_join_type_table_pixel(
     // the join column is the primary key in the catalog_to_<left> table.
     //
     // We start by assuming the join column is the primary key in the catalog_to_<left> table.
-    let catalog_to_dataset = Dataset::new(
-        get_xmatch_path(
-            xmatch_data.path.clone(),
-            Some(join_path_model.left_catalogue.clone()),
-        )?,
-        false,
-    );
+    let catalog_to_dataset = &datasets.catalog_to_left;
 
     // Only use the best associations in catalog_to_<left>, as in the column join.
     let catalog_to_lf = if use_partitioning {
@@ -229,7 +234,7 @@ fn xmatch_phase1_join_type_table_pixel(
     let right_cat_model = xmatch_data
         .get_catalogue_model(xmatch_data.catalogue_name.as_str())
         .unwrap();
-    let right_cat_dataset = Dataset::new(right_cat_model.hats_path.clone(), true);
+    let right_cat_dataset = &datasets.right_cat;
 
     let right_cat_lf = if use_partitioning {
         let right_cat_pixels =
@@ -255,7 +260,10 @@ fn xmatch_phase1_join_type_table_pixel(
         .unwrap();
 
     let catalog_to_lf = if join_path_model.left_on != left_cat_model.primary_key {
-        let left_cat_dataset = Dataset::new(left_cat_model.hats_path.clone(), true);
+        let left_cat_dataset = datasets
+            .left_cat
+            .as_ref()
+            .expect("left catalogue dataset must exist if the join column is not the pk");
 
         let left_cat_lf = if use_partitioning {
             let left_cat_pixels =

@@ -21,6 +21,64 @@ pub(crate) const RIGHT_PK_COLUMN: &str = "__xmatch_right_pk";
 /// Reserved name for the join column of the catalogue being processed during phase 1 joins.
 pub(crate) const RIGHT_ON_COLUMN: &str = "__xmatch_right_on";
 
+/// Datasets used to process each pixel of a phase 1 join path.
+///
+/// They are created once per join path and shared between the pixel workers, so that their
+/// partition info is only read once. None of them is modified while the join path is processed.
+pub(crate) struct Phase1Datasets {
+    /// The HATS dataset of the catalogue being processed ("right").
+    pub(crate) right_cat: Dataset,
+    /// The catalog_to_<left> dataset.
+    pub(crate) catalog_to_left: Dataset,
+    /// The HATS dataset of the left catalogue. Only needed (and created) if the left join column
+    /// is not the left primary key.
+    pub(crate) left_cat: Option<Dataset>,
+}
+
+impl Phase1Datasets {
+    /// Creates the datasets for a join path.
+    ///
+    /// Returns `None` if the catalog_to_<left> dataset does not exist, in which case there is
+    /// nothing to join.
+    pub(crate) fn new(
+        xmatch_data: &XMatchData,
+        join_path_model: &JoinPathModel,
+    ) -> Result<Option<Self>> {
+        let right_cat_model = xmatch_data
+            .get_catalogue_model(xmatch_data.catalogue_name.as_str())
+            .unwrap();
+        let left_cat_model = xmatch_data
+            .get_catalogue_model(&join_path_model.left_catalogue)
+            .unwrap();
+
+        let catalog_to_left_path = xmatch::tools::get_xmatch_path(
+            xmatch_data.path.clone(),
+            Some(left_cat_model.name.clone()),
+        )?;
+
+        if !catalog_to_left_path.exists() {
+            log::warn!(
+                "[{}] - Phase 1 - catalog_to_{} does not exist. Skipping join path.",
+                xmatch_data.catalogue_name.to_uppercase(),
+                left_cat_model.name
+            );
+            return Ok(None);
+        }
+
+        let left_cat = if join_path_model.left_on != left_cat_model.primary_key {
+            Some(Dataset::new(left_cat_model.hats_path.clone(), true))
+        } else {
+            None
+        };
+
+        Ok(Some(Self {
+            right_cat: Dataset::new(right_cat_model.hats_path.clone(), true),
+            catalog_to_left: Dataset::new(catalog_to_left_path, false),
+            left_cat,
+        }))
+    }
+}
+
 // Process one join path on the primary key.
 // Here "left" is the catalogue already cross-matched and "right" is the catalogue being processed.
 pub(crate) fn xmatch_phase1_join_type_column(
@@ -53,7 +111,11 @@ pub(crate) fn xmatch_phase1_join_type_column(
 
         // Call the "pixel" function without a pixel, which will process all the joins without
         // partitioning.
-        xmatch_phase1_join_type_column_pixel(None, xmatch_data, join_path_model).unwrap();
+        let Some(datasets) = Phase1Datasets::new(xmatch_data, join_path_model)? else {
+            return Ok(());
+        };
+        xmatch_phase1_join_type_column_pixel(None, xmatch_data, join_path_model, &datasets)
+            .unwrap();
         return Ok(());
     }
 
@@ -73,6 +135,10 @@ pub(crate) fn xmatch_phase1_join_type_column(
     );
     let xmatch_partition_info = xmatch_dataset.partition();
     let n_pixels = xmatch_partition_info.len() as u64;
+
+    let Some(datasets) = Phase1Datasets::new(xmatch_data, join_path_model)? else {
+        return Ok(());
+    };
 
     // Prepare a progress tracker.
     let progress_tracker = if let Some(progress_file) = &xmatch_data.options.progress_file {
@@ -101,6 +167,7 @@ pub(crate) fn xmatch_phase1_join_type_column(
                     Some((xmatch_order, xmatch_pixel)),
                     xmatch_data,
                     join_path_model,
+                    &datasets,
                 )
                 .unwrap();
 
@@ -126,6 +193,7 @@ fn xmatch_phase1_join_type_column_pixel(
     xmatch_order_pixel: Option<(u8, u64)>,
     xmatch_data: &XMatchData,
     join_path_model: &JoinPathModel,
+    datasets: &Phase1Datasets,
 ) -> Result<()> {
     let log_prefix = format!(
         "[{}] - Phase 1 -",
@@ -163,7 +231,7 @@ fn xmatch_phase1_join_type_column_pixel(
 
     // Scan the right catalogue data. We get the matching pixels for the xmatch-pixels and
     // their neighbours to ensure we include all matching rows.
-    let right_cat_dataset = Dataset::new(right_cat_model.hats_path.clone(), true);
+    let right_cat_dataset = &datasets.right_cat;
 
     let right_lf = if use_partitioning {
         let xmatch_right_neighbours =
@@ -207,13 +275,7 @@ fn xmatch_phase1_join_type_column_pixel(
     }
 
     // Get the lazy frame for the catalog_to table for the "left" catalogue.
-    let catalog_to_dataset = Dataset::new(
-        xmatch::tools::get_xmatch_path(
-            xmatch_data.path.clone(),
-            Some(left_cat_model.name.clone()),
-        )?,
-        false,
-    );
+    let catalog_to_dataset = &datasets.catalog_to_left;
 
     let catalog_to_lf = if use_partitioning {
         // The left catalogue may not have any entries in this xmatch pixel.
@@ -243,7 +305,10 @@ fn xmatch_phase1_join_type_column_pixel(
     // If the join column is the primary key, that will be present in the catalog_to table.
     // Otherwise, we need to join with the actual catalogue.
     let catalog_to_lf = if left_join_column != left_primary_key {
-        let left_cat_dataset = Dataset::new(left_cat_model.hats_path.clone(), true);
+        let left_cat_dataset = datasets
+            .left_cat
+            .as_ref()
+            .expect("left catalogue dataset must exist if the join column is not the pk");
 
         let mut left_cat_lf = if use_partitioning {
             let left_cat_neighbours =

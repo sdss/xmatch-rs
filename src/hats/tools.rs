@@ -227,12 +227,13 @@ pub fn get_healpix_map(dataset_path: PathBuf, map_order: u8) -> Result<Vec<u32>>
     // Get the partition info for the dataset.
     let partition_info = PartitionInfo::from_dataset(&dataset_path, true).unwrap();
 
+    // We need an Arc-wrapped version of the partition info for parallel processing. Cloning the
+    // partition info is cheap.
+    let partition_info_arc = Arc::new(partition_info.clone());
+
     // Create the HEALPix map as a list of zeroes.
     let npix = 12u32 * ((2u32).pow(map_order as u32)).pow(2);
     let map = Arc::new(Mutex::new(vec![0u32; npix as usize]));
-
-    // We need an Arc-wrapped version of the partition info for parallel processing.
-    let partition_info_arc = Arc::new(PartitionInfo::from_dataset(&dataset_path, true).unwrap());
 
     // Iterate over each pixel in the dataset and update the HEALPix map accordingly.
     partition_info
@@ -272,8 +273,9 @@ pub fn get_healpix_map(dataset_path: PathBuf, map_order: u8) -> Result<Vec<u32>>
                 let grouped = lf
                     .group_by(["map_pixel"])
                     .agg(vec![col("_healpix_29").count().alias("row_count")])
-                    .collect()
-                    .unwrap();
+                    .collect_with_engine(Engine::Streaming)
+                    .unwrap()
+                    .unwrap_single();
 
                 // Update the HEALPix map with the aggregated row counts.
                 let map_pixels = grouped.column("map_pixel").unwrap().u64().unwrap().iter();
@@ -289,8 +291,12 @@ pub fn get_healpix_map(dataset_path: PathBuf, map_order: u8) -> Result<Vec<u32>>
         })
         .unwrap();
 
-    // Get the map in the NESTED scheme.
-    let nested_map = map.lock().unwrap().clone();
+    // Get the map in the NESTED scheme. All the workers are done so we can move the map out of
+    // the mutex instead of cloning it.
+    let nested_map = Arc::try_unwrap(map)
+        .expect("HEALPix map is still shared")
+        .into_inner()
+        .unwrap();
 
     let layer_nested = cdshealpix::nested::get(map_order);
 
@@ -300,6 +306,7 @@ pub fn get_healpix_map(dataset_path: PathBuf, map_order: u8) -> Result<Vec<u32>>
         let ring_pixel = layer_nested.to_ring(nested_pixel as u64);
         ring_map[ring_pixel as usize] = count;
     }
+    drop(nested_map);
 
     Ok(ring_map)
 }

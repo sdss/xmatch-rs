@@ -238,9 +238,15 @@ fn list_pixels_to_repartition(
 
     let mut pixels = vec![];
 
+    let order_0_path = path.join(format!("Norder={}", order_0));
+    if !order_0_path.exists() {
+        return Ok(vec![]);
+    }
+
     if let Some(max_rows_per_pixel) = max_rows_per_pixel {
-        // Scan the parquet files in the initial order dataset.
-        let pl_path = PlRefPath::new(path.to_string_lossy().as_ref());
+        // Scan the parquet files in the initial order dataset. Only scan the order_0 directory,
+        // otherwise pixels with the same Npix but different orders would be counted together.
+        let pl_path = PlRefPath::new(order_0_path.to_string_lossy().as_ref());
         let lf = LazyFrame::scan_parquet(pl_path, ScanArgsParquet::default())?;
 
         // Group by pixel and count rows, then filter pixels that exceed the max row count.

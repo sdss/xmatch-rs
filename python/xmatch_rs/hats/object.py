@@ -971,14 +971,20 @@ def add_sequential_primary_key(path: pathlib.Path, primary_key_column: str) -> N
         nrows = lazy_frame_row_count(lf)
 
         # Add the primary key column as a range starting from the current pk value
-        # and as the first column.
-        lf = lf.select(
-            polars.arange(pk, pk + nrows, dtype=polars.UInt64).alias(
-                primary_key_column
-            ),
-            polars.all(),
+        # and as the first column. The offset is added after casting to UInt64 so
+        # that it does not depend on the Polars index type.
+        lf = lf.with_row_index(primary_key_column).with_columns(
+            polars.col(primary_key_column).cast(polars.UInt64) + pk
         )
-        lf.sink_parquet(file, engine="streaming")
+
+        # Write to a temporary file in the same directory and replace the original
+        # file, since we cannot safely sink to the file we are scanning from.
+        tmp_file = file.with_name(f".{file.name}.tmp")
+        try:
+            lf.sink_parquet(tmp_file, engine="streaming")
+            tmp_file.replace(file)
+        finally:
+            tmp_file.unlink(missing_ok=True)
 
         pk += nrows
 

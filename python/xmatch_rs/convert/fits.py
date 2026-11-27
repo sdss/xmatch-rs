@@ -14,8 +14,9 @@ import pathlib
 
 from typing import TYPE_CHECKING, Literal, Sequence
 
+import numpy
 import polars
-from astropy.table import Table
+from astropy.table import MaskedColumn, Table
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -39,22 +40,59 @@ if TYPE_CHECKING:
 __all__ = ["read_fits_to_dataframe", "convert_fits_to_parquet"]
 
 
+# Characters removed by astropy (numpy.strings.rstrip) when stripping bytes.
+_ASCII_WHITESPACE = " \t\n\r\x0b\x0c"
+
+
 def read_fits_to_dataframe(
     fits_path: str | pathlib.Path,
     hdu: int | str | None = None,
 ) -> polars.DataFrame:
-    """Reads a FITS file into a Polars DataFrame."""
+    """Reads a FITS file into a Polars DataFrame.
 
-    data = Table.read(fits_path, hdu=hdu)
-    data.convert_bytestring_to_unicode()
+    The file is memory-mapped and converted to Polars one column at a time to
+    reduce the peak memory usage. String columns are kept as bytes and decoded
+    in Polars to avoid the inflation of Numpy unicode arrays (four bytes per
+    character). The result is equivalent to reading the table with the default
+    `~astropy.table.Table.read` options (``mask_invalid=True`` and
+    ``strip_spaces=True``), which are not applied by astropy when memory-mapping.
 
-    data_input = {}
-    for col in data.dtype.names:
-        data_input[col] = data[col].astype(data.dtype[col].type, copy=False)
+    """
 
-    df = polars.DataFrame(data_input)
+    # Astropy falls back to reading into memory if the file cannot be memory-mapped
+    # (e.g., for compressed files).
+    data = Table.read(fits_path, hdu=hdu, memmap=True)
 
-    return df
+    series: list[polars.Series] = []
+    for col in data.colnames:
+        column = data[col]
+        is_masked = isinstance(column, MaskedColumn)
+
+        if column.dtype.kind == "S":
+            # Decode bytes as UTF-8 in Polars and replicate astropy's strip_spaces
+            # (trailing ASCII whitespace) and mask_invalid (empty strings) options.
+            mask = numpy.ma.getmaskarray(column) if is_masked else None
+            values = (
+                polars.Series(col, numpy.asarray(column))
+                .cast(polars.String)
+                .str.strip_chars_end(_ASCII_WHITESPACE)
+            )
+            if mask is not None:
+                values = values.scatter(numpy.flatnonzero(mask), None)
+            else:
+                values = values.replace("", None)
+        else:
+            values = polars.Series(col, column.astype(column.dtype.type, copy=False))
+            # Replicate mask_invalid for float columns. Columns with a FITS null
+            # value are already masked and astropy does not mask NaNs for them.
+            if values.dtype.is_float() and not is_masked:
+                values = values.fill_nan(None)
+
+        series.append(values)
+
+    del data
+
+    return polars.DataFrame(series)
 
 
 def convert_fits_to_parquet(

@@ -135,6 +135,18 @@ pub(crate) fn run_phase_3(xmatch_data: XMatchData) -> Result<()> {
 
         let progress_tracker = Mutex::new(progress_tracker);
 
+        // Create the catalog_to_table dataset once and share it between the pixel workers, so
+        // that its partition info is only read once. Phase 3 writes to a temporary directory so
+        // the dataset does not change while the pixels are processed.
+        let catalog_to_table_path = get_xmatch_path_root(xmatch_data.path.clone())?
+            .join(format!("catalog_to_{}/dataset", cat_model.name));
+
+        let catalog_to_table_dataset = if catalog_to_table_path.exists() {
+            Some(Dataset::new(catalog_to_table_path, false))
+        } else {
+            None
+        };
+
         let pool = crate::tools::create_pool(Some(n_workers))?;
         pool.install(|| {
             use rayon::iter::ParallelIterator;
@@ -162,12 +174,6 @@ pub(crate) fn run_phase_3(xmatch_data: XMatchData) -> Result<()> {
                             .map(|pp| (xmatch_data.model.pixelation_order, *pp))
                             .collect::<Vec<_>>();
 
-                    // Scan the relevant pixels.
-                    let xmatch_dataset_path = get_xmatch_path_root(xmatch_data.path.clone())?;
-
-                    let catalog_to_table_path =
-                        xmatch_dataset_path.join(format!("catalog_to_{}/dataset", cat_model.name));
-
                     // Placeholder used when there are no catalog_to_table entries around this
                     // pixel. In that case all the targets in the pixel are new.
                     let empty_catalog_to_table_lf = || {
@@ -186,28 +192,27 @@ pub(crate) fn run_phase_3(xmatch_data: XMatchData) -> Result<()> {
                         .lazy()
                     };
 
-                    let catalog_to_table_lf = if catalog_to_table_path.exists() {
-                        let catalog_to_table_dataset =
-                            Dataset::new(catalog_to_table_path.clone(), false);
-                        let catalog_to_table_partition = catalog_to_table_dataset.partition();
-                        let cat_to_pixels = xmatch_pixels
-                            .iter()
-                            .filter(|(oo, pp)| {
-                                catalog_to_table_partition.contains(*oo, *pp).unwrap()
-                            })
-                            .copied()
-                            .collect::<Vec<_>>();
+                    let catalog_to_table_lf =
+                        if let Some(catalog_to_table_dataset) = &catalog_to_table_dataset {
+                            let catalog_to_table_partition = catalog_to_table_dataset.partition();
+                            let cat_to_pixels = xmatch_pixels
+                                .iter()
+                                .filter(|(oo, pp)| {
+                                    catalog_to_table_partition.contains(*oo, *pp).unwrap()
+                                })
+                                .copied()
+                                .collect::<Vec<_>>();
 
-                        // No targets in this region were matched in phases 1 or 2. We still
-                        // need to process the pixel so that its targets are added to catalog.
-                        if cat_to_pixels.is_empty() {
-                            empty_catalog_to_table_lf()
+                            // No targets in this region were matched in phases 1 or 2. We still
+                            // need to process the pixel so that its targets are added to catalog.
+                            if cat_to_pixels.is_empty() {
+                                empty_catalog_to_table_lf()
+                            } else {
+                                catalog_to_table_dataset.scan_pixels(cat_to_pixels)?
+                            }
                         } else {
-                            catalog_to_table_dataset.scan_pixels(cat_to_pixels)?
-                        }
-                    } else {
-                        empty_catalog_to_table_lf()
-                    };
+                            empty_catalog_to_table_lf()
+                        };
 
                     xmatch_phase3_process_lf(
                         &cat_pixel_lf,

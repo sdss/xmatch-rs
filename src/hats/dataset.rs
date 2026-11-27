@@ -5,7 +5,7 @@
  *  @License: BSD 3-clause (http://www.opensource.org/licenses/BSD-3-Clause)
  */
 
-use std::{fs::File, path::PathBuf, sync::RwLock};
+use std::{collections::HashSet, fs::File, path::PathBuf, sync::RwLock};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use itertools::Itertools;
@@ -25,14 +25,31 @@ static ACCESS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub struct PartitionInfo {
     _df: DataFrame,
     _file_path: Option<PathBuf>,
+
+    // Set of (Norder, Npix) pairs for fast lookups. Shared between clones.
+    _pixels: Arc<HashSet<(u8, u64)>>,
 }
 
 impl PartitionInfo {
     /// Creates a `PartitionInfo` from a `DataFrame`.
     pub fn from(_df: DataFrame) -> Self {
+        Self::new(_df, None)
+    }
+
+    /// Creates a `PartitionInfo` and builds the set of pixels used for lookups.
+    fn new(_df: DataFrame, _file_path: Option<PathBuf>) -> Self {
+        let norder = _df.column("Norder").unwrap().u8().unwrap();
+        let npix = _df.column("Npix").unwrap().u64().unwrap();
+
+        let _pixels = norder
+            .into_no_null_iter()
+            .zip(npix.into_no_null_iter())
+            .collect::<HashSet<_>>();
+
         Self {
             _df,
-            _file_path: None,
+            _file_path,
+            _pixels: Arc::new(_pixels),
         }
     }
 
@@ -54,10 +71,7 @@ impl PartitionInfo {
 
         let _lock = ACCESS_MUTEX.lock().unwrap();
 
-        Ok(Self {
-            _df: lf.collect()?,
-            _file_path: Some(path.clone()),
-        })
+        Ok(Self::new(lf.collect()?, Some(path.clone())))
     }
 
     /// Creates a `PartitionInfo` from a dataset path.
@@ -111,10 +125,7 @@ impl PartitionInfo {
 
         let _lock = ACCESS_MUTEX.lock().unwrap();
 
-        Ok(Self {
-            _df: lf.collect()?,
-            _file_path: None,
-        })
+        Ok(Self::new(lf.collect()?, None))
     }
 
     /// Writes the partition info to a CSV file.
@@ -202,13 +213,7 @@ impl PartitionInfo {
 
     /// Checks if the partition info contains a given order and pixel.
     pub fn contains(&self, order: u8, npix: u64) -> Result<bool> {
-        let filtered = self
-            .get()
-            .lazy()
-            .filter(col("Norder").eq(lit(order)).and(col("Npix").eq(lit(npix))));
-
-        let df = filtered.collect()?;
-        Ok(df.height() > 0)
+        Ok(self._pixels.contains(&(order, npix)))
     }
 
     /// Did we read the partition info from a file?
@@ -332,25 +337,21 @@ pub trait AsDataset {
         // Vector of neighbours in the dataset.
         let mut neighbours: Vec<(u8, u64)> = Vec::new();
 
-        // Iterate over the dataset orders. For each one, retrieves the list of pixels in the
-        // dataset and compares it with the list of neighbours, converted to the dataset order.
+        // Iterate over the dataset orders. For each one, convert the neighbours to the dataset
+        // order and check which of them are in the dataset.
         for dataset_order in dataset_min_order..=dataset_max_order {
-            // List of pixels in the current order.
-            let order_pixels = partition_info.list_order_pixels(dataset_order)?;
-
             // Convert the neighbours to the current dataset order.
             let test_pixels = native_neighbours
                 .iter()
                 .flat_map(|np| healpix_convert_order(*np, norder, dataset_order))
-                .unique()
-                .collect::<Vec<_>>();
+                .unique();
 
             // Check if any of the converted pixels are in the partition info for the dataset.
-            order_pixels.iter().for_each(|p| {
-                if test_pixels.contains(&p) {
-                    neighbours.push((dataset_order, *p));
+            for test_pixel in test_pixels {
+                if partition_info.contains(dataset_order, test_pixel)? {
+                    neighbours.push((dataset_order, test_pixel));
                 }
-            });
+            }
         }
 
         // Sort by order, then pixel.
@@ -571,6 +572,12 @@ impl AsDataset for Dataset {
     }
 
     fn partition(&self) -> PartitionInfo {
+        // Fast path. Most calls find the partition already cached, so avoid taking the write
+        // lock, which would serialise the workers that share this dataset.
+        if let Some(partition) = self._partition_cache.read().unwrap().as_ref() {
+            return partition.clone();
+        }
+
         let mut cache = self._partition_cache.write().unwrap();
 
         if let Some(partition) = cache.as_ref() {

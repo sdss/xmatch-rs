@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import pathlib
 
+import polars
+
 def repartition(
     path: str | pathlib.Path,
     order_0: int,
@@ -179,7 +181,7 @@ def create_margin_cache(
 def get_healpix_map(
     dataset_path: str | pathlib.Path,
     map_order: int,
-) -> list[int]:
+) -> polars.Series:
     """Returns a HEALPix map from a HATS dataset.
 
     Parameters
@@ -191,10 +193,10 @@ def get_healpix_map(
 
     Returns
     -------
-    list
-        The HEALPix map as a list of integers. Each element represents the number of
+    polars.Series
+        The HEALPix map as a ``UInt32`` series. Each element represents the number of
         targets in the HATS dataset corresponding to each HEALPix pixel at the
-        specified order. The list follows the RING scheme.
+        specified order. The map follows the RING scheme.
 
     """
 

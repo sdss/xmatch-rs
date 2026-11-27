@@ -116,3 +116,100 @@ pub fn match_sky_radius(
 
     Ok(matches)
 }
+
+/// A single match returned by [`match_sky_radius_flat`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyMatch {
+    /// Index of the coordinate in the second set (the query).
+    pub index2: usize,
+    /// Index of the neighbour in the first set.
+    pub index1: usize,
+    /// Distance between the two coordinates, in radians.
+    pub distance: f64,
+}
+
+/// Same as [`match_sky_radius`] but returns a flat vector of matches.
+///
+/// [`match_sky_radius`] allocates one vector per coordinate in `coords2`, even if it has no
+/// matches. This function only stores the matches. They are ordered by `index2` and, for each
+/// `index2`, by increasing distance, as returned by [`match_sky_radius`].
+///
+pub fn match_sky_radius_flat(
+    coords1: &[(f64, f64)],
+    coords2: &[(f64, f64)],
+    radius: f64,
+) -> Result<Vec<SkyMatch>> {
+    // Initialise the k-d tree.
+    let mut kdtree = KdTree::new(2);
+
+    // Build the tree using the first set of coordinates.
+    for (i, coord) in coords1.iter().enumerate() {
+        kdtree.add([coord.0, coord.1], i)?;
+    }
+
+    // Rayon's collect preserves the order of the input, so the matches are sorted by index2.
+    let matches = coords2
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(index2, coord)| {
+            kdtree
+                .within(&[coord.0, coord.1], radius, &spherical_distance)
+                .unwrap()
+                .into_iter()
+                .map(move |(distance, index1)| SkyMatch {
+                    index2,
+                    index1: *index1,
+                    distance,
+                })
+        })
+        .collect();
+
+    Ok(matches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_match_sky_radius_flat_matches_nested() {
+        let to_rad = |ra: f64, dec: f64| (ra.to_radians(), dec.to_radians());
+
+        let coords1 = vec![
+            to_rad(10.0, 10.0),
+            to_rad(10.0, 10.0001),
+            to_rad(20.0, -5.0),
+            to_rad(10.001, 10.0),
+        ];
+        let coords2 = vec![
+            to_rad(10.00001, 10.0),
+            to_rad(50.0, 50.0),
+            to_rad(20.0, -5.00001),
+        ];
+        let radius = (1.0f64 / 3600.0).to_radians();
+
+        let nested = match_sky_radius(&coords1, &coords2, radius).unwrap();
+        let flat = match_sky_radius_flat(&coords1, &coords2, radius).unwrap();
+
+        let expected = nested
+            .iter()
+            .enumerate()
+            .flat_map(|(index2, matches)| {
+                matches.iter().map(move |(distance, index1)| SkyMatch {
+                    index2,
+                    index1: *index1,
+                    distance: *distance,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(flat, expected);
+
+        // Target 0 matches 0 and 1 (closest first), target 1 has no matches, target 2 matches 2.
+        let pairs = flat
+            .iter()
+            .map(|m| (m.index2, m.index1))
+            .collect::<Vec<_>>();
+        assert_eq!(pairs, vec![(0, 0), (0, 1), (2, 2)]);
+    }
+}

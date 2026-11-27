@@ -10,8 +10,9 @@ pub(crate) mod py_hats {
     use std::path::PathBuf;
 
     use anyhow::{Result, bail};
+    use polars::prelude::*;
     use pyo3::prelude::*;
-    use pyo3_polars::PyDataFrame;
+    use pyo3_polars::{PyDataFrame, PySeries};
 
     use crate::hats::{
         self,
@@ -170,8 +171,11 @@ pub(crate) mod py_hats {
     }
 
     #[pyfunction(name = "get_healpix_map")]
-    pub fn py_get_healpix_map(dataset_path: PathBuf, map_order: u8) -> Result<Vec<u32>> {
-        hats::tools::get_healpix_map(dataset_path, map_order)
+    pub fn py_get_healpix_map(dataset_path: PathBuf, map_order: u8) -> Result<PySeries> {
+        // Return a Polars series instead of a list. The series is passed to Python without
+        // copying, while a list would create one Python int object per pixel.
+        let map = hats::tools::get_healpix_map(dataset_path, map_order)?;
+        Ok(PySeries(Series::from_vec("healpix_map".into(), map)))
     }
 
     #[pyfunction(name = "create_partition_info")]

@@ -226,14 +226,15 @@ fn _create_hats_index_full(
         ScanArgsParquet::default(),
     )?;
 
-    // Group by the index column.
-    let lf = lf.group_by([col("Norder"), col("Dir"), col("Npix"), col(index_column)]);
+    let group_columns = [col("Norder"), col("Dir"), col("Npix"), col(index_column)];
+    let extra_columns = extra_columns.clone().unwrap_or_default();
 
     // If checking for duplicates, we count the number of rows in each group
     // and filter out those with more than 1 row.
     if options.check_duplicates {
         let dupes = lf
             .clone()
+            .group_by(group_columns.clone())
             .agg([col(index_column).count().alias("n")])
             .filter(col("n").gt(1));
         if dupes
@@ -246,15 +247,25 @@ fn _create_hats_index_full(
         }
     }
 
-    // Add the extra columns to the index.
-    let lf = lf.agg(
-        extra_columns
-            .as_ref()
-            .unwrap_or(&Vec::new())
-            .iter()
-            .map(|col_name| col(col_name).first().alias(col_name))
-            .collect::<Vec<_>>(),
-    );
+    let lf = if options.check_duplicates {
+        // We know there are no duplicates, so grouping would return one row per input row. Use
+        // a select instead, which streams without building a hash table of every row.
+        lf.select(
+            group_columns
+                .into_iter()
+                .chain(extra_columns.iter().map(|col_name| col(col_name)))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        // Group by the index column and add the extra columns to the index. If there are
+        // duplicates, the first value of each extra column is kept.
+        lf.group_by(group_columns).agg(
+            extra_columns
+                .iter()
+                .map(|col_name| col(col_name).first().alias(col_name))
+                .collect::<Vec<_>>(),
+        )
+    };
 
     // Optionally sort the index by the index column.
     let lf = if options.sort {
