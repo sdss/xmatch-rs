@@ -96,7 +96,7 @@ def make_hats(tmp_path: pathlib.Path) -> Callable[..., HATS]:
             tmp_path / "hats" / name,
             schema=make_schema(name, df, primary_key, **schema_kwargs),
             format="parquet",
-            initial_order=2,
+            initial_order=5,
             max_rows_per_pixel=None,
             create_density_map=False,
             show_progress=False,

@@ -741,7 +741,7 @@ impl ProgressTracker {
         self.update_progress(self.n_total, self.n_total)?;
         std::fs::remove_file(&self.progress_file_path)?;
 
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
         Ok(())
     }

@@ -1039,6 +1039,10 @@ class ProgressTracker:
         self._monitor_process_task: threading.Thread | None = None
         self._file_process_task: threading.Thread | None = None
 
+        # Set when exiting the context, to stop the monitor thread even if the progress
+        # file is never written (e.g., if the phase is skipped).
+        self._stop_monitor = threading.Event()
+
         self.pbar: Progress | None = None
         self.pbar_task: TaskID | None = None
 
@@ -1070,6 +1074,8 @@ class ProgressTracker:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stop_monitor.set()
+
         if self._monitor_process_task is not None:
             self._monitor_process_task.join(timeout=5)
 
@@ -1126,7 +1132,7 @@ class ProgressTracker:
 
         file_existed = False
 
-        while True:
+        while not self._stop_monitor.is_set():
             if self.progress_file.exists():
                 file_existed = True
 
@@ -1141,7 +1147,7 @@ class ProgressTracker:
                     except json.JSONDecodeError:
                         # In case we are reading the file as it's being written
                         # and it's not valid JSON yet, we just wait and try again.
-                        time.sleep(1)
+                        self._stop_monitor.wait(0.1)
                         continue
 
                     show_progress = progress_data.get("show_progress", True)
@@ -1158,7 +1164,7 @@ class ProgressTracker:
                     )
                     self.pbar.start()
                 elif self.pbar_task is None:
-                    time.sleep(1)
+                    self._stop_monitor.wait(0.1)
                     continue
 
                 self.pbar.update(self.pbar_task, completed=n_completed, total=n_total)
@@ -1170,7 +1176,7 @@ class ProgressTracker:
             if file_existed and not self.progress_file.exists():
                 break
 
-            time.sleep(1)  # Sleep for a bit before checking again
+            self._stop_monitor.wait(0.1)  # Wait for a bit before checking again
 
         if self.pbar_task is not None:
             self.pbar.update(self.pbar_task, visible=False)
