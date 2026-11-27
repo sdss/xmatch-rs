@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use polars::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread::available_parallelism;
 
 use crate::hats::dataset::{AsDataset, Dataset};
@@ -19,6 +19,12 @@ use crate::xmatch::tools::get_xmatch_path;
 use super::phase_1_column::{
     Phase1Datasets, RIGHT_ON_COLUMN, RIGHT_PK_COLUMN, remove_already_xmatched,
 };
+
+/// Reserved name for the join table right column when ranking the candidates of a target.
+const JOIN_TABLE_RIGHT_ON_COLUMN: &str = "__xmatch_join_table_right_on";
+/// Reserved name for the column that flags the candidates whose catalogid is in the pixel
+/// being processed.
+const CENTRAL_COLUMN: &str = "__xmatch_central";
 
 // Process one join path on the primary key.
 // Here "left" is the catalogue that has already been cross-matched and "right" is the
@@ -75,6 +81,8 @@ pub(crate) fn xmatch_phase1_join_type_table(
                 .trim_matches('"')
         );
     }
+
+    check_join_table_ranking(join_path_model)?;
 
     if !join_path_model.use_partitioning {
         log::debug!(
@@ -162,6 +170,50 @@ pub(crate) fn xmatch_phase1_join_type_table(
     Ok(())
 }
 
+/// Returns the column used to rank the candidates of a target and whether higher values are
+/// better, or `None` if the join table type does not need ranking.
+///
+/// For Gaia neighbourhood and best neighbour join tables, each target in the new catalogue may
+/// be matched to several catalogids. The best candidate is the one with the highest score for
+/// neighbourhood tables and the one with the smallest angular distance for best neighbour tables.
+fn join_table_ranking(join_path_model: &JoinPathModel) -> Option<(&'static str, bool)> {
+    match join_path_model.join_table_type {
+        Some(JoinPathTableType::GaiaNeighbourhood) => Some(("score", true)),
+        Some(JoinPathTableType::GaiaBestNeighbour) => Some(("angular_distance", false)),
+        _ => None,
+    }
+}
+
+/// Scans the join table. We assume that the join table may not be in HATS format, so we scan
+/// all the parquet files.
+fn scan_join_table(join_path_model: &JoinPathModel) -> Result<LazyFrame> {
+    let join_table_path = join_path_model.join_table_path.clone().unwrap();
+    Ok(LazyFrame::scan_parquet(
+        to_pl_path(&join_table_path.join("**/*.parquet"))?,
+        Default::default(),
+    )?)
+}
+
+/// Checks that the join table has the column used to rank the candidates, if needed.
+fn check_join_table_ranking(join_path_model: &JoinPathModel) -> Result<()> {
+    let Some((ranking_column, _)) = join_table_ranking(join_path_model) else {
+        return Ok(());
+    };
+
+    if !scan_join_table(join_path_model)?
+        .collect_schema()?
+        .contains(ranking_column)
+    {
+        anyhow::bail!(
+            "Join table {} does not have a '{}' column.",
+            join_path_model.join_table_path.as_ref().unwrap().display(),
+            ranking_column
+        );
+    }
+
+    Ok(())
+}
+
 // Process one pixel of the from catalogue.
 fn xmatch_phase1_join_type_table_pixel(
     xmatch_order_pixel: Option<(u8, u64)>,
@@ -192,107 +244,39 @@ fn xmatch_phase1_join_type_table_pixel(
         anyhow::bail!("Right-to-left joins are not yet supported.");
     }
 
-    // We need to generate the appropriate join depending on the type of join table and whether
-    // the join column is the primary key in the catalog_to_<left> table.
-    //
-    // We start by assuming the join column is the primary key in the catalog_to_<left> table.
     let catalog_to_dataset = &datasets.catalog_to_left;
+    let ranking = join_table_ranking(join_path_model);
 
-    // For Gaia neighbourhood and best neighbour join tables, each target in the new catalogue
-    // may be matched to several catalogids, which can fall in different xmatch pixels. To select
-    // the best one consistently, when using partitioning we read the catalog_to_<left> entries
-    // in the neighbouring pixels as well, so that all the candidates of the targets in this
-    // pixel are considered, and then only keep the rows for catalogids in the central pixel.
-    //
-    // The best candidate is the one with the highest score for neighbourhood tables and the one
-    // with the smallest angular distance for best neighbour tables.
-    let ranking: Option<(&str, bool)> = match join_path_model.join_table_type {
-        Some(JoinPathTableType::GaiaNeighbourhood) => Some(("score", true)),
-        Some(JoinPathTableType::GaiaBestNeighbour) => Some(("angular_distance", false)),
-        _ => None,
-    };
-
-    // Only use the best associations in catalog_to_<left>, as in the column join.
-    let catalog_to_lf = if use_partitioning {
-        // The left catalogue may not have any entries in this xmatch pixel.
-        if !catalog_to_dataset
+    // The left catalogue may not have any entries in this xmatch pixel.
+    if use_partitioning
+        && !catalog_to_dataset
             .partition()
             .contains(xmatch_order, xmatch_pixel)?
-        {
-            log::trace!(
-                "{} ({}, {}): no catalog_to_{} entries in pixel, skipping.",
-                log_prefix,
-                xmatch_order,
-                xmatch_pixel,
-                join_path_model.left_catalogue
-            );
-            return Ok(());
-        }
-
-        if ranking.is_some() {
-            let catalog_to_pixels =
-                catalog_to_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
-            catalog_to_dataset.scan_pixels(catalog_to_pixels)?
-        } else {
-            catalog_to_dataset.scan_pixel(xmatch_order, xmatch_pixel, false)?
-        }
-    } else {
-        catalog_to_dataset.get_frame()?
-    }
-    .filter(col("best").eq(lit(true)));
-
-    // Read the join table. We assume that the join table may not be in HATS format, so we scan
-    // all the parquet files.
-    let join_table_path = join_path_model.join_table_path.clone().unwrap();
-    let join_table_lf = LazyFrame::scan_parquet(
-        to_pl_path(&join_table_path.join("**/*.parquet"))?,
-        Default::default(),
-    )?;
-
-    if let Some((ranking_column, _)) = ranking
-        && !join_table_lf
-            .clone()
-            .collect_schema()?
-            .contains(ranking_column)
     {
-        anyhow::bail!(
-            "Join table {} does not have a '{}' column.",
-            join_table_path.display(),
-            ranking_column
+        log::trace!(
+            "{} ({}, {}): no catalog_to_{} entries in pixel, skipping.",
+            log_prefix,
+            xmatch_order,
+            xmatch_pixel,
+            join_path_model.left_catalogue
         );
+        return Ok(());
     }
 
-    // Read the right catalogue. When using partitioning, we select all the neighbouring pixels to
-    // make sure we get all the rows that may match the input pixel.
     let right_cat_model = xmatch_data
         .get_catalogue_model(xmatch_data.catalogue_name.as_str())
         .unwrap();
-    let right_cat_dataset = &datasets.right_cat;
-
-    let right_cat_lf = if use_partitioning {
-        let right_cat_pixels =
-            right_cat_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
-        right_cat_dataset.scan_pixels(right_cat_pixels)?
-    } else {
-        right_cat_dataset.get_frame()?
-    };
-
-    // Keep only the primary key and join column of the right catalogue, with reserved names.
-    // Otherwise they could collide with the columns from catalog_to_<left> or the join table
-    // (e.g., if both primary keys are called source_id), or the primary key could be coalesced
-    // away if it is also the join column.
-    let right_cat_lf = right_cat_lf.select([
-        col(&right_cat_model.primary_key).alias(RIGHT_PK_COLUMN),
-        col(&join_path_model.right_on).alias(RIGHT_ON_COLUMN),
-    ]);
-
-    // If the left join column is not the primary key in the catalog_to_<left> table, we need to
-    // get it from the left catalogue before joining with the join table.
     let left_cat_model = xmatch_data
         .get_catalogue_model(&join_path_model.left_catalogue)
         .unwrap();
 
-    let catalog_to_lf = if join_path_model.left_on != left_cat_model.primary_key {
+    let left_on = join_path_model.left_on.clone();
+    let join_table_left_on = join_path_model.join_table_left_on.clone().unwrap();
+    let join_table_right_on = join_path_model.join_table_right_on.clone().unwrap();
+
+    // If the left join column is not the primary key in the catalog_to_<left> table, we need to
+    // get it from the left catalogue before joining with the join table.
+    let left_cat_lf = if left_on != left_cat_model.primary_key {
         let left_cat_dataset = datasets
             .left_cat
             .as_ref()
@@ -309,30 +293,65 @@ fn xmatch_phase1_join_type_table_pixel(
             left_cat_dataset.get_frame()?
         };
 
-        let left_cat_lf = left_cat_lf.select([
-            col(&left_cat_model.primary_key),
-            col(&join_path_model.left_on),
-        ]);
-
-        catalog_to_lf.join(
-            left_cat_lf,
-            [col(&left_cat_model.primary_key)],
-            [col(&left_cat_model.primary_key)],
-            JoinArgs {
-                how: JoinType::Inner,
-                ..Default::default()
-            },
-        )
+        Some(left_cat_lf.select([col(&left_cat_model.primary_key), col(&left_on)]))
     } else {
-        catalog_to_lf
+        None
     };
 
-    // Let's do all the joins now.
+    // Scans the best associations in catalog_to_<left> (as in the column join) for some pixels,
+    // or for all of them if no pixels are given, with the left join column.
+    let scan_catalog_to_left = |pixels: Option<Vec<(u8, u64)>>| -> Result<LazyFrame> {
+        let lf = match pixels {
+            Some(pixels) => catalog_to_dataset.scan_pixels(pixels)?,
+            None => catalog_to_dataset.get_frame()?,
+        }
+        .filter(col("best").eq(lit(true)));
+
+        Ok(match &left_cat_lf {
+            Some(left_cat_lf) => lf.join(
+                left_cat_lf.clone(),
+                [col(&left_cat_model.primary_key)],
+                [col(&left_cat_model.primary_key)],
+                JoinArgs {
+                    how: JoinType::Inner,
+                    ..Default::default()
+                },
+            ),
+            None => lf,
+        })
+    };
+
+    let join_table_lf = scan_join_table(join_path_model)?;
+
+    // Read the right catalogue. When using partitioning, we select all the neighbouring pixels to
+    // make sure we get all the rows that may match the input pixel.
+    let right_cat_dataset = &datasets.right_cat;
+
+    let right_cat_lf = if use_partitioning {
+        let right_cat_pixels =
+            right_cat_dataset.get_neighbours(xmatch_order, xmatch_pixel, true)?;
+        right_cat_dataset.scan_pixels(right_cat_pixels)?
+    } else {
+        right_cat_dataset.get_frame()?
+    };
+
+    // Keep only the primary key and join column of the right catalogue, with reserved names.
+    // Otherwise they could collide with the columns from catalog_to_<left> or the join table
+    // (e.g., if both primary keys are called source_id).
+    let right_cat_lf = right_cat_lf.select([
+        col(&right_cat_model.primary_key).alias(RIGHT_PK_COLUMN),
+        col(&join_path_model.right_on).alias(RIGHT_ON_COLUMN),
+    ]);
+
+    // Let's do all the joins now, for the catalogids in this pixel.
+    let catalog_to_lf =
+        scan_catalog_to_left(use_partitioning.then(|| vec![(xmatch_order, xmatch_pixel)]))?;
+
     let joined_lf = catalog_to_lf
         .join(
-            join_table_lf,
-            [col(join_path_model.left_on.clone())],
-            [col(join_path_model.join_table_left_on.clone().unwrap())],
+            join_table_lf.clone(),
+            [col(&left_on)],
+            [col(&join_table_left_on)],
             JoinArgs {
                 how: JoinType::Inner,
                 ..Default::default()
@@ -340,7 +359,7 @@ fn xmatch_phase1_join_type_table_pixel(
         )
         .join(
             right_cat_lf,
-            [col(join_path_model.join_table_right_on.clone().unwrap())],
+            [col(&join_table_right_on)],
             [col(RIGHT_ON_COLUMN)],
             JoinArgs {
                 how: JoinType::Inner,
@@ -348,32 +367,142 @@ fn xmatch_phase1_join_type_table_pixel(
             },
         );
 
-    // Restore the name of the right primary key, dropping any other column with that name.
-    let joined_lf = joined_lf
-        .drop(Selector::ByName {
-            names: Arc::new([right_cat_model.primary_key.clone().into()]),
-            strict: false,
-        })
-        .rename(
-            [RIGHT_PK_COLUMN],
-            [right_cat_model.primary_key.as_str()],
-            true,
-        );
+    // Keep only the columns we need. For ranking we also keep the ranking value and the join
+    // table right column, which is used to find the candidates in the neighbouring pixels.
+    let mut columns = vec![col("catalogid"), col("_healpix_29"), col(RIGHT_PK_COLUMN)];
+    if let Some((ranking_column, _)) = ranking {
+        columns.push(col(ranking_column));
+        columns.push(col(&join_table_right_on).alias(JOIN_TABLE_RIGHT_ON_COLUMN));
+    }
+    let joined_lf = joined_lf.select(columns);
 
     // Finally, we remove entries that were already cross-matched using previous join paths.
     let joined_lf = remove_already_xmatched(
         joined_lf,
-        &right_cat_model.primary_key,
+        RIGHT_PK_COLUMN,
         xmatch_order_pixel,
         xmatch_data,
         datasets,
     )?;
 
-    // Each target in the new catalogue may be matched to multiple catalogids. For each target
-    // we mark as best the candidate with the best ranking value (ties are broken by the lowest
-    // catalogid) but we keep all of them.
-    let joined_lf = if let Some((ranking_column, descending)) = ranking {
-        let right_pk = col(&right_cat_model.primary_key);
+    // Collect the associations once, instead of counting the rows and then writing them, which
+    // would run the joins twice.
+    let joined_df = joined_lf
+        .collect_with_engine(Engine::Streaming)?
+        .unwrap_single();
+
+    let n_rows = joined_df.height();
+
+    if n_rows == 0 {
+        log::trace!(
+            "{} ({}, {}): no rows to write, skipping.",
+            log_prefix,
+            xmatch_order,
+            xmatch_pixel,
+        );
+        return Ok(());
+    }
+
+    log::trace!(
+        "{} ({}, {}): {} rows successfully joined.",
+        log_prefix,
+        xmatch_order,
+        xmatch_pixel,
+        n_rows
+    );
+
+    // Each target in the new catalogue may be matched to multiple catalogids, which can fall in
+    // different xmatch pixels. For each target we mark as best the candidate with the best
+    // ranking value (ties are broken by the lowest catalogid) but we keep all of them.
+    let lf = if let Some((ranking_column, descending)) = ranking {
+        // The columns of the candidates, in the same order for this pixel and its neighbours.
+        let candidate_columns = |central: bool| {
+            vec![
+                col("catalogid"),
+                col("_healpix_29"),
+                col(RIGHT_PK_COLUMN),
+                col(ranking_column),
+                col(JOIN_TABLE_RIGHT_ON_COLUMN),
+                lit(central).alias(CENTRAL_COLUMN),
+            ]
+        };
+
+        let candidates_lf = joined_df.clone().lazy().select(candidate_columns(true));
+
+        // When using partitioning, add the candidates for catalogids in the neighbouring pixels,
+        // but only for the targets matched in this pixel. Those are few, so we restrict the join
+        // table to them before joining it with catalog_to_<left>.
+        let neighbour_pixels = if use_partitioning {
+            catalog_to_dataset.get_neighbours(xmatch_order, xmatch_pixel, false)?
+        } else {
+            Vec::new()
+        };
+
+        let candidates_lf = if neighbour_pixels.is_empty() {
+            candidates_lf
+        } else {
+            let right_on_values = joined_df
+                .column(JOIN_TABLE_RIGHT_ON_COLUMN)?
+                .unique()?
+                .as_materialized_series()
+                .clone();
+
+            let join_table_lf = join_table_lf
+                .select([
+                    col(&join_table_left_on),
+                    col(&join_table_right_on).alias(JOIN_TABLE_RIGHT_ON_COLUMN),
+                    col(ranking_column),
+                ])
+                .filter(
+                    col(JOIN_TABLE_RIGHT_ON_COLUMN)
+                        .is_in(lit(right_on_values).implode(false), false),
+                );
+
+            // The right primary keys of the targets matched in this pixel.
+            let right_pk_lf = joined_df
+                .select([JOIN_TABLE_RIGHT_ON_COLUMN, RIGHT_PK_COLUMN])?
+                .lazy()
+                .unique(None, UniqueKeepStrategy::Any);
+
+            let neighbours_lf = scan_catalog_to_left(Some(neighbour_pixels))?
+                .select([col("catalogid"), col("_healpix_29"), col(&left_on)])
+                .join(
+                    join_table_lf,
+                    [col(&left_on)],
+                    [col(&join_table_left_on)],
+                    JoinArgs {
+                        how: JoinType::Inner,
+                        ..Default::default()
+                    },
+                )
+                .join(
+                    right_pk_lf,
+                    [col(JOIN_TABLE_RIGHT_ON_COLUMN)],
+                    [col(JOIN_TABLE_RIGHT_ON_COLUMN)],
+                    JoinArgs {
+                        how: JoinType::Inner,
+                        ..Default::default()
+                    },
+                );
+
+            let neighbours_lf = remove_already_xmatched(
+                neighbours_lf,
+                RIGHT_PK_COLUMN,
+                xmatch_order_pixel,
+                xmatch_data,
+                datasets,
+            )?;
+
+            concat(
+                [
+                    candidates_lf,
+                    neighbours_lf.select(candidate_columns(false)),
+                ],
+                UnionArgs::default(),
+            )?
+        };
+
+        let right_pk = col(RIGHT_PK_COLUMN);
 
         let ranking_value = col(ranking_column);
         let best_ranking_value = if descending {
@@ -390,53 +519,23 @@ fn xmatch_phase1_join_type_table_pixel(
             .min()
             .over([right_pk])?;
 
-        joined_lf.with_columns([is_best_ranking
-            .and(col("catalogid").eq(min_catalogid_best_ranking))
-            .fill_null(lit(false))
-            .alias("best")])
+        // Keep only the catalogids in this pixel. Rows for catalogids in the neighbouring
+        // pixels are written when those pixels are processed.
+        candidates_lf
+            .with_columns([is_best_ranking
+                .and(col("catalogid").eq(min_catalogid_best_ranking))
+                .fill_null(lit(false))
+                .alias("best")])
+            .filter(col(CENTRAL_COLUMN))
     } else {
-        joined_lf.with_columns([lit(true).alias("best")])
+        joined_df.lazy().with_columns([lit(true).alias("best")])
     };
-
-    // Keep only the catalogids in the central pixel. Rows for catalogids in the neighbouring
-    // pixels are written when those pixels are processed.
-    let joined_lf = if use_partitioning && ranking.is_some() {
-        let n_sub = 4_u64.pow((29 - xmatch_order) as u32);
-        joined_lf.filter(
-            col("_healpix_29")
-                .gt_eq(lit(xmatch_pixel * n_sub))
-                .and(col("_healpix_29").lt(lit((xmatch_pixel + 1) * n_sub))),
-        )
-    } else {
-        joined_lf
-    };
-
-    // Check the number of rows.
-    let lf_nrows = crate::tools::lf_row_count(&joined_lf)?;
-
-    if lf_nrows == 0 {
-        log::trace!(
-            "{} ({}, {}): no rows to write, skipping.",
-            log_prefix,
-            xmatch_order,
-            xmatch_pixel,
-        );
-        return Ok(());
-    }
-
-    log::trace!(
-        "{} ({}, {}): {} rows successfully joined.",
-        log_prefix,
-        xmatch_order,
-        xmatch_pixel,
-        lf_nrows
-    );
 
     let added_on = chrono::Utc::now().timestamp_millis();
-    let lf = joined_lf.select([
+    let lf = lf.select([
         col("catalogid"),
         col("_healpix_29"),
-        col(&right_cat_model.primary_key).alias("pk"),
+        col(RIGHT_PK_COLUMN).alias("pk"),
         lit(xmatch_data.model.version.clone())
             .cast(DataType::String)
             .alias("version"),
