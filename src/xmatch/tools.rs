@@ -798,6 +798,44 @@ pub fn sink_lazyframe_to_file(lf: LazyFrame, file_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Flags the best row of each group of a lazy frame.
+///
+/// Rows are sorted by `group_column` and then by each `(column, descending)` pair in
+/// `order_by`, with nulls last. The first row of each group is flagged as `true` in a new
+/// column `alias`, the rest as `false`. A row whose first `order_by` value is null is never
+/// flagged. The returned frame is sorted by `group_column` and `order_by`.
+///
+/// This is equivalent to comparing each row with the minimum or maximum of the group computed
+/// with window expressions, but much faster. Nested window expressions (a window inside the
+/// aggregation of another window) are extremely slow in Polars for large frames.
+pub(crate) fn flag_best_per_group(
+    lf: LazyFrame,
+    group_column: &str,
+    order_by: &[(&str, bool)],
+    alias: &str,
+) -> LazyFrame {
+    let mut by: Vec<PlSmallStr> = vec![group_column.into()];
+    let mut descending = vec![false];
+    for (column, desc) in order_by {
+        by.push((*column).into());
+        descending.push(*desc);
+    }
+
+    let sort_options = SortMultipleOptions::default()
+        .with_order_descending_multi(descending)
+        .with_nulls_last(true)
+        .with_maintain_order(true);
+
+    // After sorting, the first row of each group is the one whose group value differs from the
+    // previous row. neq_missing() treats the null from shift() in the first row as different.
+    let mut is_first = col(group_column).neq_missing(col(group_column).shift(lit(1)));
+    if let Some((first_order_column, _)) = order_by.first() {
+        is_first = is_first.and(col(*first_order_column).is_not_null());
+    }
+
+    lf.sort(by, sort_options).with_column(is_first.alias(alias))
+}
+
 /// Adds the healpix_xmatch column to a lazy frame.
 pub fn add_healpix_xmatch_column(lf: LazyFrame, xmatch_order: u8) -> Result<LazyFrame> {
     let lf = lf.with_column(
@@ -843,6 +881,63 @@ pub(crate) fn should_skip(xmatch_data: &XMatchData, phase: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_flag_best_per_group() {
+        let df = df!(
+            "group" => [1u64, 1, 1, 2, 2, 3, 3, 4],
+            "value" => [Some(2.0f64), Some(1.0), Some(1.0), None, Some(5.0), Some(3.0), Some(4.0), None],
+            "tie" => [10u64, 30, 20, 1, 2, 5, 6, 7],
+        )
+        .unwrap();
+
+        // Lowest value, ties broken by the lowest tie column.
+        let result = flag_best_per_group(
+            df.clone().lazy(),
+            "group",
+            &[("value", false), ("tie", false)],
+            "best",
+        )
+        .filter(col("best"))
+        .select([col("group"), col("tie")])
+        .collect()
+        .unwrap();
+
+        let groups: Vec<u64> = result
+            .column("group")
+            .unwrap()
+            .u64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        let ties: Vec<u64> = result
+            .column("tie")
+            .unwrap()
+            .u64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+
+        // Group 4 only has a null value, so it has no best row.
+        assert_eq!(groups, vec![1, 2, 3]);
+        assert_eq!(ties, vec![20, 2, 5]);
+
+        // Highest value.
+        let result = flag_best_per_group(df.lazy(), "group", &[("value", true)], "best")
+            .filter(col("best"))
+            .select([col("tie")])
+            .collect()
+            .unwrap();
+
+        let ties: Vec<u64> = result
+            .column("tie")
+            .unwrap()
+            .u64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(ties, vec![10, 2, 6]);
+    }
 
     #[test]
     fn test_run_id_catalogid_range() {
