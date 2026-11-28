@@ -441,11 +441,12 @@ fn xmatch_phase1_join_type_table_pixel(
         let candidates_lf = if neighbour_pixels.is_empty() {
             candidates_lf
         } else {
-            let right_on_values = joined_df
-                .column(JOIN_TABLE_RIGHT_ON_COLUMN)?
-                .unique()?
-                .as_materialized_series()
-                .clone();
+            // Restrict the join table with a semi-join. Filtering with is_in() and a literal list
+            // of values is much slower when there are many values (dense pixels).
+            let right_on_values_lf = joined_df
+                .select([JOIN_TABLE_RIGHT_ON_COLUMN])?
+                .lazy()
+                .unique(None, UniqueKeepStrategy::Any);
 
             let join_table_lf = join_table_lf
                 .select([
@@ -453,9 +454,14 @@ fn xmatch_phase1_join_type_table_pixel(
                     col(&join_table_right_on).alias(JOIN_TABLE_RIGHT_ON_COLUMN),
                     col(ranking_column),
                 ])
-                .filter(
-                    col(JOIN_TABLE_RIGHT_ON_COLUMN)
-                        .is_in(lit(right_on_values).implode(false), false),
+                .join(
+                    right_on_values_lf,
+                    [col(JOIN_TABLE_RIGHT_ON_COLUMN)],
+                    [col(JOIN_TABLE_RIGHT_ON_COLUMN)],
+                    JoinArgs {
+                        how: JoinType::Semi,
+                        ..Default::default()
+                    },
                 );
 
             // The right primary keys of the targets matched in this pixel.
@@ -502,31 +508,19 @@ fn xmatch_phase1_join_type_table_pixel(
             )?
         };
 
-        let right_pk = col(RIGHT_PK_COLUMN);
-
-        let ranking_value = col(ranking_column);
-        let best_ranking_value = if descending {
-            ranking_value.clone().max()
-        } else {
-            ranking_value.clone().min()
-        }
-        .over([right_pk.clone()])?;
-
-        let is_best_ranking = ranking_value.eq(best_ranking_value);
-        let min_catalogid_best_ranking = when(is_best_ranking.clone())
-            .then(col("catalogid"))
-            .otherwise(lit(NULL))
-            .min()
-            .over([right_pk])?;
+        // Flag the candidate with the best ranking value for each target, breaking ties by the
+        // lowest catalogid. We sort instead of using window expressions, which are extremely
+        // slow for dense pixels.
+        let candidates_lf = xmatch::tools::flag_best_per_group(
+            candidates_lf,
+            RIGHT_PK_COLUMN,
+            &[(ranking_column, descending), ("catalogid", false)],
+            "best",
+        );
 
         // Keep only the catalogids in this pixel. Rows for catalogids in the neighbouring
         // pixels are written when those pixels are processed.
-        candidates_lf
-            .with_columns([is_best_ranking
-                .and(col("catalogid").eq(min_catalogid_best_ranking))
-                .fill_null(lit(false))
-                .alias("best")])
-            .filter(col(CENTRAL_COLUMN))
+        candidates_lf.filter(col(CENTRAL_COLUMN))
     } else {
         joined_df.lazy().with_columns([lit(true).alias("best")])
     };

@@ -706,22 +706,16 @@ fn set_best_per_catalogid(dataset_path: &std::path::Path, primary_key: &str) -> 
 
         let lf = concat(frames, UnionArgs::default())?;
 
-        // Closest target for each catalogid.
-        let is_min_distance = col("distance").eq(col("distance").min().over([col("catalogid")])?);
-
-        // Break ties using the lowest primary key.
-        let min_pk_min_distance = when(is_min_distance.clone())
-            .then(col(primary_key))
-            .otherwise(lit(NULL))
-            .min()
-            .over([col("catalogid")])?;
-
-        let best = is_min_distance.and(col(primary_key).eq(min_pk_min_distance));
-
-        let df = lf
-            .with_column(best.alias("best"))
-            .sort(["catalogid"], Default::default())
-            .collect()?;
+        // Closest target for each catalogid, breaking ties using the lowest primary key. We sort
+        // instead of using window expressions, which are extremely slow for large frames. The
+        // result is sorted by catalogid.
+        let df = xmatch_tools::flag_best_per_group(
+            lf,
+            "catalogid",
+            &[("distance", false), (primary_key, false)],
+            "best",
+        )
+        .collect()?;
 
         // Write the new file and then remove the old ones.
         let uuid = uuid::Uuid::new_v4().to_string().replace("-", "");
